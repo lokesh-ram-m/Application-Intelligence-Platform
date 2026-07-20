@@ -1,0 +1,19 @@
+<Project>
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <!--
+    .NET 10 added System.ApplicationId, which collides with our domain ApplicationId under
+    implicit usings. This global alias makes the simple name resolve to our type everywhere.
+  -->
+  <ItemGroup>
+    <Using Include="Aip.Core.Domain.ApplicationId" Alias="ApplicationId" />
+  </ItemGroup>
+</Project>

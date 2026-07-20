@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.14.0" />
+    <!-- Real semantic resolution requires the analyzed repo's own NuGet package assemblies loaded into
+         the compilation, not just the BCL — MSBuildWorkspace (backed by an actual `dotnet restore`) is
+         the correct way to get that; Microsoft.Build.Locator finds the MSBuild toolset it needs. -->
+    <PackageReference Include="Microsoft.Build.Locator" Version="1.7.8" />
+    <PackageReference Include="Microsoft.CodeAnalysis.Workspaces.MSBuild" Version="4.14.0" />
+    <!-- Microsoft.CodeAnalysis.CSharp alone only provides the syntax/semantic API (CSharpCompilation,
+         CSharpSyntaxTree) — MSBuildWorkspace needs this separate package's language services registered
+         for it to recognize a .csproj's Language="C#" at all. Without it: "language 'C#' is not supported." -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="4.14.0" />
+    <!-- NU1903 override: Microsoft.CodeAnalysis.Workspaces.MSBuild 4.14.0 transitively pulls
+         Microsoft.Build.Tasks.Core 17.7.2 (CVE-2025-26646, fixed at 17.14.8+ within the 17.14.x line).
+         17.14.8 itself is caught by a second, separate CVE (CVE-2025-55247, fixed at 17.14.28+) — pin to
+         17.14.28, still the SAME 17.x line the 4.x Workspaces API was built against. Jumping to
+         Microsoft.CodeAnalysis.Workspaces.MSBuild 5.x (which pulls MSBuild 18.x on its own) would mean
+         re-verifying the MSBuildWorkspace integration this project depends on, for no functional gain here. -->
+    <!-- ExcludeAssets="runtime" — Microsoft.Build.Locator finds and loads the real MSBuild toolset at
+         runtime (RegisterDefaults()); these references exist only to pin a patched version for NuGet's
+         vulnerability audit, not to be copied into the output directory (Locator's own build-time check
+         fails the build otherwise, and copying them in would be wrong regardless — it'd risk shipping a
+         mismatched MSBuild alongside whatever toolset Locator actually resolves at runtime). -->
+    <PackageReference Include="Microsoft.Build" Version="17.14.28" ExcludeAssets="runtime" />
+    <PackageReference Include="Microsoft.Build.Framework" Version="17.14.28" ExcludeAssets="runtime" />
+    <PackageReference Include="Microsoft.Build.Tasks.Core" Version="17.14.28" ExcludeAssets="runtime" />
+    <PackageReference Include="Microsoft.Build.Utilities.Core" Version="17.14.28" ExcludeAssets="runtime" />
+    <!-- Microsoft.Build.Tasks.Core itself still declares a vulnerable System.Security.Cryptography.Xml
+         9.0.0 dependency even at its patched release — override that too. -->
+    <PackageReference Include="System.Security.Cryptography.Xml" Version="10.0.10" />
+    <ProjectReference Include="../Aip.Core/Aip.Core.csproj" />
+    <ProjectReference Include="../Aip.Abstractions/Aip.Abstractions.csproj" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.10" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.10" />
+  </ItemGroup>
+</Project>

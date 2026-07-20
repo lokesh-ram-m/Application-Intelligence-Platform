@@ -1,0 +1,9 @@
+**/bin/
+**/obj/
+output/
+.git/
+.gitignore
+*.db
+
+# Never bake local secrets into an image layer — production config comes from environment variables.
+appsettings.Development.json

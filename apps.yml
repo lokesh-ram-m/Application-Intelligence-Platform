@@ -1,0 +1,27 @@
+# Application Intelligence Platform — the estate to analyze.
+# Each repo entry is a git URL (shallow-cloned automatically) or a local path (relative to this file).
+# An application can span many repositories; the Knowledge Model describes the whole application.
+#
+# Every app in this file is auto-diffed against its last analyzed commit and (re)published only when
+# something actually changed — there is no separate CI/CD/webhook trigger, just this one flow:
+#
+#   dotnet run --project src/Aip.Host -- run --config apps.yml   # one-off, for local testing
+#   dotnet run --project src/Aip.Host -- serve --config apps.yml # standalone, POST /run to trigger a run
+#                                                                 # (see README's "Deployment" section)
+applications:
+  - name: CleanArchitecture
+    repos:
+      - https://github.com/jasontaylordev/CleanArchitecture.git
+
+  - name: EntityManagement
+    repos:
+      - https://synergech@dev.azure.com/synergech/Synergech%20Internal%20Tools/_git/entity-management#main
+
+  - name: ProjectAllocation
+    repos:
+      - https://synergech@dev.azure.com/synergech/Synergech%20Internal%20Tools/_git/Project-Allocation
+
+  - name: CMS
+    repos:
+      - https://synergech@dev.azure.com/synergech/Synergech%20Internal%20Tools/_git/cms-backend#develop
+      - https://synergech@dev.azure.com/synergech/Synergech%20Internal%20Tools/_git/cms-frontend#develop

@@ -1,0 +1,26 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Aip.Abstractions/Aip.Abstractions.csproj" />
+    <Project Path="src/Aip.Ai/Aip.Ai.csproj" />
+    <Project Path="src/Aip.Analysis/Aip.Analysis.csproj" />
+    <Project Path="src/Aip.Core/Aip.Core.csproj" />
+    <Project Path="src/Aip.Engines.Roslyn/Aip.Engines.Roslyn.csproj" />
+    <Project Path="src/Aip.Engines.TypeScript/Aip.Engines.TypeScript.csproj" />
+    <Project Path="src/Aip.Host/Aip.Host.csproj" />
+    <Project Path="src/Aip.Infrastructure/Aip.Infrastructure.csproj" />
+    <Project Path="src/Aip.Infrastructure.AzureBlob/Aip.Infrastructure.AzureBlob.csproj" />
+    <Project Path="src/Aip.Knowledge/Aip.Knowledge.csproj" />
+    <Project Path="src/Aip.Observability/Aip.Observability.csproj" />
+    <Project Path="src/Aip.Plugins.Angular/Aip.Plugins.Angular.csproj" />
+    <Project Path="src/Aip.Plugins.AspNetCore/Aip.Plugins.AspNetCore.csproj" />
+    <Project Path="src/Aip.Plugins.NextJs/Aip.Plugins.NextJs.csproj" />
+    <Project Path="src/Aip.Plugins.React/Aip.Plugins.React.csproj" />
+    <Project Path="src/Aip.Projections/Aip.Projections.csproj" />
+    <Project Path="src/Aip.Query/Aip.Query.csproj" />
+    <Project Path="src/Aip.Registries/Aip.Registries.csproj" />
+    <Project Path="src/Aip.Viewer/Aip.Viewer.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Aip.Tests/Aip.Tests.csproj" />
+  </Folder>
+</Solution>

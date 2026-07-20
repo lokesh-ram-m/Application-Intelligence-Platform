@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Unlocks WebApplication/minimal APIs for `serve` mode (Serve.cs) without switching the whole
+         project to the Web SDK — every other CLI mode (verify/demo/run) is unaffected. -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Aip.Core/Aip.Core.csproj" />
+    <ProjectReference Include="../Aip.Abstractions/Aip.Abstractions.csproj" />
+    <ProjectReference Include="../Aip.Analysis/Aip.Analysis.csproj" />
+    <ProjectReference Include="../Aip.Knowledge/Aip.Knowledge.csproj" />
+    <ProjectReference Include="../Aip.Projections/Aip.Projections.csproj" />
+    <ProjectReference Include="../Aip.Ai/Aip.Ai.csproj" />
+    <ProjectReference Include="../Aip.Query/Aip.Query.csproj" />
+    <ProjectReference Include="../Aip.Registries/Aip.Registries.csproj" />
+    <ProjectReference Include="../Aip.Observability/Aip.Observability.csproj" />
+    <ProjectReference Include="../Aip.Infrastructure/Aip.Infrastructure.csproj" />
+    <ProjectReference Include="../Aip.Infrastructure.AzureBlob/Aip.Infrastructure.AzureBlob.csproj" />
+    <ProjectReference Include="../Aip.Engines.Roslyn/Aip.Engines.Roslyn.csproj" />
+    <ProjectReference Include="../Aip.Engines.TypeScript/Aip.Engines.TypeScript.csproj" />
+    <ProjectReference Include="../Aip.Plugins.AspNetCore/Aip.Plugins.AspNetCore.csproj" />
+    <ProjectReference Include="../Aip.Plugins.Angular/Aip.Plugins.Angular.csproj" />
+    <ProjectReference Include="../Aip.Plugins.React/Aip.Plugins.React.csproj" />
+    <ProjectReference Include="../Aip.Plugins.NextJs/Aip.Plugins.NextJs.csproj" />
+    <!-- DependencyInjection/Logging/Configuration.* are now supplied transitively by the
+         Microsoft.AspNetCore.App FrameworkReference above. -->
+    <PackageReference Include="YamlDotNet" Version="18.1.0" />
+  </ItemGroup>
+</Project>
