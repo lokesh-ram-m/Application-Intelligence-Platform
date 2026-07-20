@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="../Aip.Core/Aip.Core.csproj" />
+    <ProjectReference Include="../Aip.Abstractions/Aip.Abstractions.csproj" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection.Abstractions" Version="10.0.10" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Abstractions" Version="10.0.10" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.10" />
+    <!-- serve mode's real /health check (SQL Server connectivity) — non-web, so this stays usable from a
+         plain console entry point too, not just Aip.Host's ASP.NET Core hosting. -->
+    <PackageReference Include="Microsoft.Extensions.Diagnostics.HealthChecks" Version="10.0.10" />
+    <!-- Logging: Serilog lives here (the logging "adapter"), same pattern as every other concrete
+         Infrastructure implementation behind a Core/Platform port. Console for local visibility, SQL
+         Server for a durable, queryable record — the same database as Run History. -->
+    <PackageReference Include="Serilog.Extensions.Logging" Version="10.0.0" />
+    <PackageReference Include="Serilog.Sinks.Console" Version="6.1.1" />
+    <PackageReference Include="Serilog.Sinks.MSSqlServer" Version="10.0.0" />
+    <!-- Run History store: SQL Server / Azure SQL only. The same connection string drives a local Docker
+         SQL Server container in dev and Azure SQL in production (History:ConnectionString) — no SQLite. -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" Version="10.0.10" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="10.0.10">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+    <!-- NU1903 overrides: Microsoft.EntityFrameworkCore.Design pulls in Microsoft.Build.Tasks.Core, which
+         (even at its latest patched release) still declares a vulnerable System.Security.Cryptography.Xml
+         dependency. Pin both explicitly to patched versions rather than letting the transitive graph win. -->
+    <PackageReference Include="Microsoft.Build.Tasks.Core" Version="17.14.28" ExcludeAssets="runtime" />
+    <PackageReference Include="System.Security.Cryptography.Xml" Version="10.0.10" />
+  </ItemGroup>
+</Project>
