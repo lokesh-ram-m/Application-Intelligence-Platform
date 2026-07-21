@@ -70,8 +70,13 @@ public sealed record DocumentVersionsIndex(IReadOnlyList<DocumentVersionEntry> V
     public const string FileName = "_versions.json";
 }
 
-/// <summary>One application known to the document store — enough for a landing page to link to it.</summary>
-public sealed record ApplicationIndexEntry(string Name, string Slug);
+/// <summary>One application known to the document store — enough for a landing page to link to it.
+/// <paramref name="Children"/> names sub-applications this one covers (empty for a leaf application) —
+/// lets the landing page group composites and their children instead of listing every app flat.</summary>
+public sealed record ApplicationIndexEntry(string Name, string Slug, IReadOnlyList<string>? Children = null)
+{
+    public IReadOnlyList<string> Children { get; init; } = Children ?? Array.Empty<string>();
+}
 
 /// <summary>
 /// Every application that currently has documentation in the store. Written to a reserved pseudo-

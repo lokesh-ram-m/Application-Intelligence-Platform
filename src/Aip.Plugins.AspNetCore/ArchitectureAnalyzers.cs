@@ -43,8 +43,28 @@ internal sealed class InfrastructureAnalyzer : IAnalyzer
             }
         }
 
+        // A scheduled/always-on background job isn't only "the app registered Hangfire/Quartz" — a class
+        // extending BackgroundService or directly implementing IHostedService IS one, run entirely by the
+        // .NET runtime with no framework registration call to scan for. Same BackgroundJob kind either way;
+        // this just recognizes the second, structural way one gets into an app.
+        foreach ((TypeDeclarationSyntax decl, INamedTypeSymbol symbol, _, string path) in Sym.Types(model))
+        {
+            if (symbol.TypeKind != TypeKind.Class || !IsHostedService(symbol, decl)) continue;
+
+            Evidence ev = context.Evidence(path, Sym.Line(decl), symbol.Name);
+            sink.Add(NodeDiscovery.Create(
+                context.AppNodeId(Sym.Seg("backgroundjob", symbol.Name)),
+                NodeKind.From("BackgroundJob"), new[] { ev }, Confidence.Full,
+                Sym.Props(("name", symbol.Name), ("detail", "hosted service"))));
+        }
+
         return Task.CompletedTask;
     }
+
+    private static bool IsHostedService(INamedTypeSymbol symbol, TypeDeclarationSyntax decl) =>
+        Sym.InheritsFrom(symbol, decl, "BackgroundService") ||
+        symbol.AllInterfaces.Any(i => i.Name == "IHostedService") ||
+        (decl.BaseList?.Types.Any(t => t.Type.ToString().Split('.').Last() == "IHostedService") ?? false);
 
     // Framework API method name → the architectural fact it implies. Generic across any .NET app.
     private static (string Kind, string Name, string Detail)? Classify(string call) => call switch
@@ -201,6 +221,7 @@ internal sealed class MessagingAnalyzer : IAnalyzer
         { "Consume", "ReceiveMessageAsync", "ReceiveMessagesAsync", "StartProcessingAsync" };
     private static readonly string[] ConsumerInterfaces = { "IConsumer", "IHandleMessages", "IMessageHandler", "IIntegrationEventHandler", "ICapSubscribe" };
     private static readonly string[] DlqMarkers = { "x-dead-letter", "DeadLetter", "RedrivePolicy", "ConfigureDeadLetter", "dead-letter" };
+    private static readonly string[] NotificationReceiverHints = { "email", "notif", "mail" };
 
     public Task AnalyzeAsync(IAnalysisContext context, IDiscoverySink sink, CancellationToken ct = default)
     {
@@ -266,6 +287,37 @@ internal sealed class MessagingAnalyzer : IAnalyzer
             }
         }
 
+        // Pass 3 — notification/email dispatch. No broker SDK is involved here, so this can't be gated on a
+        // namespace import like Pass 2 — instead it's gated on the call SHAPE: a "Send*" method invoked on
+        // a receiver whose own name suggests email/notification. A birthday reminder or a contract-renewal
+        // notice triggered by IEmailService.SendAsync(...) is otherwise invisible: it's just an ordinary
+        // method call on a plain C# service, nothing a broker-import gate could ever catch. The Message
+        // node is keyed by the method name itself (not an argument type, unlike Pass 2) since these calls
+        // are typically passed primitives (an address, a name), not a dedicated message class.
+        foreach (SyntaxTree tree in model.Trees)
+        {
+            string path = model.PathOf(tree);
+            SemanticModel sm = model.GetSemanticModel(tree);
+            foreach (InvocationExpressionSyntax inv in tree.GetRoot().DescendantNodes().OfType<InvocationExpressionSyntax>())
+            {
+                if (inv.Expression is not MemberAccessExpressionSyntax member) continue;
+                string method = member.Name.Identifier.Text;
+                if (!method.Contains("Send", StringComparison.Ordinal)) continue;
+                string receiver = member.Expression.ToString();
+                if (!NotificationReceiverHints.Any(h => receiver.Contains(h, StringComparison.OrdinalIgnoreCase))) continue;
+
+                INamedTypeSymbol? owner = inv.Ancestors().OfType<TypeDeclarationSyntax>().FirstOrDefault() is { } td
+                    ? sm.GetDeclaredSymbol(td) as INamedTypeSymbol : null;
+                if (owner is null) continue;
+
+                Evidence ev = context.Evidence(path, Sym.Line(inv), method);
+                KnowledgeIdentity notificationId = context.AppNodeId(Sym.Seg("message", method));
+                sink.Add(NodeDiscovery.Create(notificationId, NodeKind.From("Message"), new[] { ev }, Confidence.From(0.65),
+                    Sym.Props(("name", method), ("kind", "notification"))));
+                sink.Add(RelationshipDiscovery.Create(RelationshipType.From("PUBLISHES"), TypeId(owner), notificationId, new[] { ev }, Confidence.From(0.65)));
+            }
+        }
+
         Evidence brokerEv = context.Evidence(context.Artifact.Path, null, "messaging");
         foreach (string broker in brokersSeen)
             sink.Add(NodeDiscovery.Create(context.AppNodeId(Sym.Seg("messagebroker", broker)), NodeKind.From("MessageBroker"),
@@ -278,7 +330,14 @@ internal sealed class MessagingAnalyzer : IAnalyzer
     }
 }
 
-/// <summary>Detects FluentValidation validators (types extending <c>AbstractValidator&lt;T&gt;</c>) and links them to the type they validate.</summary>
+/// <summary>
+/// Detects FluentValidation validators (types extending <c>AbstractValidator&lt;T&gt;</c>) and links them
+/// to the type they validate. Also parses each <c>RuleFor(x => x.Field)...</c> fluent chain's actual
+/// constraints (NotEmpty, MaximumLength(50), GreaterThan(0), …) — the VALIDATES relationship alone only
+/// says a validator exists for a type, not what it actually enforces, which is the more useful fact for
+/// generated documentation. <see cref="Relationship"/> has no property bag, so the parsed rules are
+/// attached to the Validator node itself rather than the relationship.
+/// </summary>
 internal sealed class ValidatorAnalyzer : IAnalyzer
 {
     public string Name => "validators";
@@ -297,13 +356,48 @@ internal sealed class ValidatorAnalyzer : IAnalyzer
             Evidence ev = context.Evidence(path, Sym.Line(decl), symbol.Name);
             KnowledgeIdentity Id(ITypeSymbol s) => context.NodeId(Sym.Seg("project", Sym.ProjectOf(s) ?? project), Sym.Seg("type", Sym.Name(s)));
 
-            sink.Add(NodeDiscovery.Create(Id(symbol), NodeKind.From("Validator"), new[] { ev }, Confidence.Full, Sym.Props(("name", symbol.Name))));
+            var props = new List<(string, string)> { ("name", symbol.Name) };
+            var rules = ParseRules(decl).ToList();
+            if (rules.Count > 0)
+                props.Add(("rules", string.Join("; ", rules.Select(r => $"{r.Field}: {string.Join(", ", r.Constraints)}"))));
+
+            sink.Add(NodeDiscovery.Create(Id(symbol), NodeKind.From("Validator"), new[] { ev }, Confidence.Full, Sym.Props(props.ToArray())));
 
             if (baseValidator.TypeArguments.FirstOrDefault() is INamedTypeSymbol validated && validated.Locations.Any(l => l.IsInSource))
                 sink.Add(RelationshipDiscovery.Create(RelationshipType.From("VALIDATES"), Id(symbol), Id(validated), new[] { ev }, Confidence.Full));
         }
 
         return Task.CompletedTask;
+    }
+
+    // RuleFor(x => x.Field).Constraint1(...).Constraint2(...) — the chain grows OUTWARD from the RuleFor(...)
+    // call itself: each successive .Method() invocation sits as the PARENT of the previous one in the syntax
+    // tree, so walking up via .Parent (member access, then its own parent invocation) visits the chain in
+    // declaration order without needing a general expression-tree walker.
+    private static IEnumerable<(string Field, List<string> Constraints)> ParseRules(TypeDeclarationSyntax decl)
+    {
+        foreach (InvocationExpressionSyntax ruleForCall in decl.DescendantNodes().OfType<InvocationExpressionSyntax>()
+            .Where(i => i.Expression is MemberAccessExpressionSyntax { Name.Identifier.Text: "RuleFor" }))
+        {
+            string? field = ruleForCall.ArgumentList.Arguments.FirstOrDefault()?.Expression switch
+            {
+                SimpleLambdaExpressionSyntax { Body: MemberAccessExpressionSyntax m } => m.Name.Identifier.Text,
+                _ => null,
+            };
+            if (field is null) continue;
+
+            var constraints = new List<string>();
+            SyntaxNode current = ruleForCall;
+            while (current.Parent is MemberAccessExpressionSyntax member && member.Parent is InvocationExpressionSyntax outer)
+            {
+                string name = member.Name.Identifier.Text;
+                string? arg = outer.ArgumentList.Arguments.FirstOrDefault()?.Expression is LiteralExpressionSyntax lit ? lit.Token.ValueText : null;
+                constraints.Add(arg is null ? name : $"{name}({arg})");
+                current = outer;
+            }
+
+            if (constraints.Count > 0) yield return (field, constraints);
+        }
     }
 }
 

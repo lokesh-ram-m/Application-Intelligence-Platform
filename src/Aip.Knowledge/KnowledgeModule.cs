@@ -15,6 +15,7 @@ public static class KnowledgeModule
         services.AddSingleton<IRelationshipResolver, ApiCallToEndpointResolver>();
         services.AddSingleton<IRelationshipResolver, ServiceToDatabaseResolver>();
         services.AddSingleton<IRelationshipResolver, PublisherSubscriberResolver>();
+        services.AddSingleton<IRelationshipResolver, AuditLogToEntityResolver>();
         services.AddSingleton<IRelationshipResolver, CrossRepositoryDependencyResolver>();
         services.AddSingleton<IRelationshipResolutionEngine, RelationshipResolutionEngine>();
 

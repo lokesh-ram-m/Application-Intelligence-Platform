@@ -7,7 +7,6 @@ using Aip.Host;
 using Aip.Infrastructure;
 using Aip.Registries;
 
-using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -21,27 +20,9 @@ public class EndToEndTests
     // its NoOp/deterministic path, same as today's behavior with no AIP_GITHUB_TOKEN set.
     private static readonly IConfiguration EmptyConfig = new ConfigurationBuilder().Build();
 
-    // Run History now requires a real SQL Server — these tests target the local Docker SQL Server
-    // container described in README.md, one throwaway database per test run so tests never collide or
-    // leave stale state behind for the next run.
-    private const string LocalSqlServer = "Server=localhost,1433;User Id=sa;Password=Aip_Local_Dev_2026!;TrustServerCertificate=True;";
-
-    private static string NewTestConnectionString(out string databaseName)
-    {
-        databaseName = "AipHistoryTest_" + Guid.NewGuid().ToString("N");
-
-        return $"{LocalSqlServer}Database={databaseName};";
-    }
-
-    private static async Task DropTestDatabaseAsync(string databaseName)
-    {
-        SqlConnection.ClearAllPools();
-        await using var master = new SqlConnection($"{LocalSqlServer}Database=master;");
-        await master.OpenAsync();
-        await using var cmd = new SqlCommand(
-            $"IF DB_ID('{databaseName}') IS NOT NULL BEGIN ALTER DATABASE [{databaseName}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{databaseName}]; END", master);
-        await cmd.ExecuteNonQueryAsync();
-    }
+    // Run History now requires a real SQL Server — one throwaway database per test run so tests never
+    // collide or leave stale state behind. Which server (local Docker, CI, Azure SQL) is resolved by
+    // TestSqlServer from the environment, never hardcoded here — see its own doc comment.
 
     private static string SolutionRoot()
     {
@@ -60,7 +41,7 @@ public class EndToEndTests
         string root = SolutionRoot();
         string temp = Path.Combine(Path.GetTempPath(), "aip-test-" + Guid.NewGuid().ToString("N"));
         Environment.SetEnvironmentVariable("AIP_OUTPUT", temp);
-        string connectionString = NewTestConnectionString(out string databaseName);
+        string connectionString = TestSqlServer.NewConnectionString(out string databaseName);
         Environment.SetEnvironmentVariable("AIP_SQL_CONNECTION_STRING", connectionString);
 
         try
@@ -101,7 +82,7 @@ public class EndToEndTests
         {
             // Runs even on assertion failure — otherwise a failing test leaks its throwaway database forever.
             if (Directory.Exists(temp)) Directory.Delete(temp, recursive: true);
-            await DropTestDatabaseAsync(databaseName);
+            await TestSqlServer.DropDatabaseAsync(databaseName);
         }
     }
 
@@ -116,7 +97,7 @@ public class EndToEndTests
         string root = SolutionRoot();
         string temp = Path.Combine(Path.GetTempPath(), "aip-test-" + Guid.NewGuid().ToString("N"));
         Environment.SetEnvironmentVariable("AIP_OUTPUT", temp);
-        string connectionString = NewTestConnectionString(out string databaseName);
+        string connectionString = TestSqlServer.NewConnectionString(out string databaseName);
         Environment.SetEnvironmentVariable("AIP_SQL_CONNECTION_STRING", connectionString);
 
         try
@@ -141,7 +122,7 @@ public class EndToEndTests
         finally
         {
             if (Directory.Exists(temp)) Directory.Delete(temp, recursive: true);
-            await DropTestDatabaseAsync(databaseName);
+            await TestSqlServer.DropDatabaseAsync(databaseName);
         }
     }
 
@@ -151,7 +132,7 @@ public class EndToEndTests
         string root = SolutionRoot();
         string temp = Path.Combine(Path.GetTempPath(), "aip-test-" + Guid.NewGuid().ToString("N"));
         Environment.SetEnvironmentVariable("AIP_OUTPUT", temp);
-        string connectionString = NewTestConnectionString(out string databaseName);
+        string connectionString = TestSqlServer.NewConnectionString(out string databaseName);
         Environment.SetEnvironmentVariable("AIP_SQL_CONNECTION_STRING", connectionString);
         var app = new ApplicationId("ShopApp");
 
@@ -186,7 +167,7 @@ public class EndToEndTests
         finally
         {
             if (Directory.Exists(temp)) Directory.Delete(temp, recursive: true);
-            await DropTestDatabaseAsync(databaseName);
+            await TestSqlServer.DropDatabaseAsync(databaseName);
         }
     }
 }

@@ -2,7 +2,15 @@ using Aip.Core.Domain;
 
 namespace Aip.Abstractions.Projections;
 
-public sealed record ProjectionRequest(Snapshot Snapshot, IReadOnlyList<string> Repositories);
+/// <summary><paramref name="Children"/> names the sub-applications folded into this Snapshot (empty for a
+/// leaf application) — lets a projection mention what a composite application actually covers.
+/// <paramref name="Notes"/> is human-authored project documentation (README.md/CLAUDE.md), null when none
+/// was found — a lower-trust input the product-specification pages may cross-reference against the
+/// Knowledge Model, never a source of verified facts on its own.</summary>
+public sealed record ProjectionRequest(Snapshot Snapshot, IReadOnlyList<string> Repositories, IReadOnlyList<string>? Children = null, string? Notes = null)
+{
+    public IReadOnlyList<string> Children { get; init; } = Children ?? Array.Empty<string>();
+}
 
 /// <summary>A single rendered output artifact of a projection (a markdown file, a JSON document, etc.).
 /// <paramref name="AiWritten"/> is whether AI actually produced <paramref name="Content"/> (as opposed to
@@ -28,7 +36,8 @@ public interface IProjection
 /// matter to the caller.</summary>
 public interface IProjectionEngine
 {
-    Task<IReadOnlyList<ProjectionResult>> RunAsync(Snapshot snapshot, IReadOnlyList<string>? repositories = null, CancellationToken ct = default);
+    Task<IReadOnlyList<ProjectionResult>> RunAsync(Snapshot snapshot, IReadOnlyList<string>? repositories = null,
+        IReadOnlyList<string>? children = null, string? notes = null, CancellationToken ct = default);
 }
 
 /// <summary>

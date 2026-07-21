@@ -37,7 +37,7 @@ internal static class PlatformRunner
             apps.Count, Path.GetFileName(configPath));
         LogAiStatus(provider, logger);
         int failures = 0;
-        foreach (ApplicationDescriptor app in apps)
+        foreach (ApplicationDescriptor app in TopologicalOrder(apps))
         {
             logger.LogInformation("▶ {AppName}  ({RepoCount} repo(s))", app.Name, app.Repositories.Count);
             ExecutionResult result = await pipeline.ExecuteAsync(
@@ -54,6 +54,30 @@ internal static class PlatformRunner
     }
 
     // ---- shared helpers ----
+
+    // Children-before-parents post-order over the Name -> Children graph, so a composite application
+    // only runs once every child it pulls a snapshot from (ExecutionPipeline.ExecuteAsync) has already
+    // committed this batch's snapshot. AppsFile.Load already guarantees the graph is acyclic and every
+    // reference resolves, so this can assume a valid DAG without re-checking either invariant.
+    internal static IReadOnlyList<ApplicationDescriptor> TopologicalOrder(IReadOnlyList<ApplicationDescriptor> apps)
+    {
+        var byName = apps.ToDictionary(a => a.Name, a => a);
+        var visited = new HashSet<string>();
+        var ordered = new List<ApplicationDescriptor>();
+
+        void Visit(ApplicationDescriptor app)
+        {
+            if (!visited.Add(app.Name)) return;
+            foreach (string child in app.Children)
+                if (byName.TryGetValue(child, out ApplicationDescriptor? childApp))
+                    Visit(childApp);
+            ordered.Add(app);
+        }
+
+        foreach (ApplicationDescriptor app in apps) Visit(app);
+
+        return ordered;
+    }
 
     private static IReadOnlyList<ApplicationDescriptor> SeedRegistry(IServiceProvider provider, string configPath)
     {

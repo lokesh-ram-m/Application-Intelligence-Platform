@@ -15,10 +15,14 @@ internal sealed class AspNetCorePlugin : IPlugin
     private readonly IReadOnlyList<IAnalyzer> _analyzers = new IAnalyzer[]
     {
         new ControllerAnalyzer(),
+        new AzureFunctionAnalyzer(),
         new ServiceAnalyzer(),
         new RepositoryAnalyzer(),
         new InterfaceAnalyzer(),
         new EntityAnalyzer(),
+        new AuditLogAnalyzer(),
+        new StatusWorkflowAnalyzer(),
+        new BusinessRuleAnalyzer(),
         new DbContextAnalyzer(),
         new DependencyInjectionAnalyzer(),
         new DependencyAnalyzer(),
@@ -42,7 +46,7 @@ internal sealed class AspNetCorePlugin : IPlugin
         Languages: new[] { "csharp" },
         Capabilities: new[]
         {
-            "Controller", "Endpoint", "Service", "Repository", "Interface", "Entity", "DataStore", "Configuration",
+            "Controller", "Endpoint", "AzureFunction", "Service", "Repository", "Interface", "Entity", "AuditLog", "StatusWorkflow", "BusinessRule", "DataStore", "Configuration",
             "Project", "Technology", "Cache", "AuthScheme", "Cors", "HealthCheck", "Logging", "Messaging",
             "BackgroundJob", "Middleware", "Authorization", "Command", "Query", "Event", "Handler", "Validator",
             "MessageBroker", "Consumer", "Message", "DataAccess", "Filter", "Resilience", "Component",

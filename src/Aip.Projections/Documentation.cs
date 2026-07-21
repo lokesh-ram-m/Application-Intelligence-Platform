@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 
 using Aip.Abstractions.Ai;
+using Aip.Abstractions.Documents;
 using Aip.Abstractions.History;
 using Aip.Abstractions.Projections;
 using Aip.Core.Abstractions;
@@ -54,6 +55,7 @@ internal sealed class DocumentationProjection : IProjection
 
     private const string Product = "product-specification";
     private const string Technical = "technical-specification";
+    private const string Notes = "notes";
 
     public async Task<ProjectionResult> ProjectAsync(ProjectionRequest request, CancellationToken ct = default)
     {
@@ -63,10 +65,12 @@ internal sealed class DocumentationProjection : IProjection
 
         var artifacts = new List<ProjectionArtifact>
         {
-            // Product Specification — enhanced by AI when available (pure narrative).
-            await Page(app, repos, $"{Product}/overview.md",   "product-overview",   1, Overview(s, app),      ct, ai: true),
-            await Page(app, repos, $"{Product}/features.md",    "product-features",   2, Features(s, app),      ct, ai: true),
-            await Page(app, repos, $"{Product}/use-cases.md",   "product-use-cases",  3, UseCases(s, app),      ct, ai: true),
+            // Product Specification — enhanced by AI when available (pure narrative). Only these three
+            // pages get project notes (README/CLAUDE.md) as extra AI context — technical pages below stay
+            // purely code-derived.
+            await OverviewPage(s, app, repos, request.Children, request.Notes, ct),
+            await Page(app, repos, $"{Product}/features.md",    "product-features",   2, Features(s, app),      ct, ai: true, notes: request.Notes),
+            await Page(app, repos, $"{Product}/use-cases.md",   "product-use-cases",  3, UseCases(s, app),      ct, ai: true, notes: request.Notes),
 
             // Technical Specification — AI adds narrative framing around every page; the AI system prompt
             // (Aip.Ai/AiModule.cs PromptTemplates.System) requires every Markdown table and ```mermaid```
@@ -77,6 +81,14 @@ internal sealed class DocumentationProjection : IProjection
             await Page(app, repos, $"{Technical}/api-reference.md",    "tech-api",          2, Api(s, app), ct, ai: true),
             await Page(app, repos, $"{Technical}/technology-stack.md", "tech-stack",        3, Technologies(s, app), ct, ai: true),
         };
+
+        // Its own top-level nav group, not filed under Product or Technical — README/CLAUDE.md content can
+        // (and usually does) mix product narrative with technical detail, so neither section fits it, and
+        // the page is raw and never AI-touched: a reader can always find the actual source material at a
+        // fixed URL regardless of what the AI did (or didn't) manage to corroborate elsewhere. Only added
+        // when there's something to show.
+        if (!string.IsNullOrWhiteSpace(request.Notes))
+            artifacts.Add(new ProjectionArtifact($"{Notes}/notes.md", "text/markdown", NotesPage(app, request.Notes), 1, false));
 
         if (Nodes(s, "DataStore").Any() || Nodes(s, "Entity").Any())
             artifacts.Add(await Page(app, repos, $"{Technical}/data-and-storage.md", "tech-data", 4, Database(s, app), ct, ai: true));
@@ -138,7 +150,46 @@ internal sealed class DocumentationProjection : IProjection
         return (deterministic, false);
     }
 
-    private async Task<ProjectionArtifact> Page(string app, IReadOnlyList<string> repos, string path, string template, int order, string deterministic, CancellationToken ct, bool ai = false)
+    // The overview page gets one extra, deterministic fragment — which sub-applications this app covers,
+    // for a composite application — appended AFTER the AI call returns (success or fallback) rather than
+    // folded into the AI's grounded seed text or asked of the AI itself, since an AI rewrite can paraphrase
+    // or drop facts from its input and this needs to survive exactly as given regardless of AI behavior.
+    private async Task<ProjectionArtifact> OverviewPage(Snapshot s, string app, IReadOnlyList<string> repos, IReadOnlyList<string> children, string? notes, CancellationToken ct)
+    {
+        ProjectionArtifact artifact = await Page(app, repos, $"{Product}/overview.md", "product-overview", 1, Overview(s, app), ct, ai: true, notes: notes);
+        string suffix = children.Count > 0 ? SubApplicationsBlock(children) : "";
+
+        return suffix.Length == 0 ? artifact : artifact with { Content = artifact.Content + suffix };
+    }
+
+    private static string SubApplicationsBlock(IReadOnlyList<string> children)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("\n## Sub-applications\n");
+        sb.AppendLine("This documentation covers the following sub-applications, merged into one Knowledge Model:\n");
+        foreach (string child in children)
+            sb.AppendLine($"- [{child}](/{DocumentPaths.SlugifyApplication(child)})");
+
+        return sb.ToString();
+    }
+
+    // The raw project notes (README/CLAUDE.md) verbatim, on their own page. The AI is instructed (see
+    // AiModule's NotesInstruction) to only weave corroborated claims into the product/technical pages,
+    // never to quote or reproduce the notes itself, so a reader can always check the actual source here
+    // rather than trust an AI transcription of it.
+    private static string NotesPage(string app, string notes)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine($"# {app} — Project Notes (unverified)\n");
+        sb.AppendLine("Human-authored README/CLAUDE.md content, shown verbatim for reference — the rest of this " +
+                       "documentation only draws on this where it could be corroborated against the Knowledge " +
+                       "Model; nothing here should be taken as independently confirmed.\n");
+        sb.AppendLine(notes);
+
+        return sb.ToString();
+    }
+
+    private async Task<ProjectionArtifact> Page(string app, IReadOnlyList<string> repos, string path, string template, int order, string deterministic, CancellationToken ct, bool ai = false, string? notes = null)
     {
         string content = deterministic;
         bool aiWritten = false;
@@ -149,7 +200,15 @@ internal sealed class DocumentationProjection : IProjection
                 var values = new Dictionary<string, string>
                 {
                     ["app"] = app,
-                    ["model"] = _context.Build(deterministic)
+                    ["model"] = _context.Build(deterministic),
+                    // Always present (never omitted) so a template referencing {{notes}} can never leak that
+                    // literal token unresolved into the prompt (PromptTemplates.Render only replaces keys it
+                    // is given — a missing key just leaves "{{notes}}" in the text). Empty when nothing was
+                    // found, which resolves to nothing rather than fabricating a "no notes" narrative; the
+                    // framing text lives in the value itself so an empty value truly adds nothing to the
+                    // prompt, not just an empty JSON string.
+                    ["notes"] = string.IsNullOrWhiteSpace(notes) ? "" :
+                        $"\n\nProject notes (README/CLAUDE.md — human-authored, may be stale or wrong, unlike the grounded model above):\n{_context.Build(TruncateForAi(notes))}",
                 };
                 content = await _ai.RenderAsync(template, values, ct);
                 aiWritten = true;
@@ -159,6 +218,14 @@ internal sealed class DocumentationProjection : IProjection
 
         return new ProjectionArtifact(path, "text/markdown", content, order, aiWritten);
     }
+
+    // Notes can now be the full contents of a real-world README (see ExecutionPipeline.ReadRepositoryNotes),
+    // which is fine for the dedicated Notes page but not for a per-page AI prompt budget — this caps only
+    // what gets sent to the AI, independent of what a human reader sees on the Notes page itself.
+    private const int MaxNotesCharsForAi = 6000;
+
+    private static string TruncateForAi(string notes) =>
+        notes.Length > MaxNotesCharsForAi ? notes[..MaxNotesCharsForAi] + "\n…(truncated for AI context)" : notes;
 
     // The one place an AI failure becomes a fallback-to-deterministic decision.
     private async Task RecordFallbackAsync(string app, IReadOnlyList<string> repos, string section, Exception ex, CancellationToken ct) =>
