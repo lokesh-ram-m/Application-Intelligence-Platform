@@ -118,10 +118,21 @@ internal sealed class ExecutionPipeline : IAnalysisPipeline
             materializations.Add((repositoryId, location, materialization, previousCommit));
         }
 
+        // Human-authored project notes (README.md/CLAUDE.md, repo root only) — read once here, alongside
+        // materialization, since projections themselves never touch the filesystem (see IProjection's own
+        // doc comment). Fed into the AI as a separate, lower-trust input the product-spec pages can
+        // cross-reference against the Knowledge Model — see DocumentationProjection/PromptTemplates.
+        string? notes = ReadRepositoryNotes(materializations);
+
         // SkipIfUnchanged applies whenever every declared repository materialized successfully and sits at
         // the same commit it was last analyzed at. This is the coarse, commit-level check — it runs before
-        // any per-file diffing, so a whole app with nothing to do never pays for it.
+        // any per-file diffing, so a whole app with nothing to do never pays for it. A composite with
+        // Children is excluded outright: a pure composite has zero Repositories, which would otherwise make
+        // both conditions vacuously true (0 == 0, .All over an empty sequence) and skip forever regardless
+        // of whether any child actually changed — composites always fall through to full processing, and
+        // rely on the diff-based "skip publish if empty" check further down to avoid a wasted version.
         bool skip = descriptor.SkipIfUnchanged
+            && descriptor.Children.Count == 0
             && materializations.Count == descriptor.Repositories.Count
             && materializations.All(m => m.PreviousCommit is not null && m.PreviousCommit == m.Materialization.Commit.Value);
 
@@ -145,12 +156,24 @@ internal sealed class ExecutionPipeline : IAnalysisPipeline
         // dedicated "full run" branch would have produced, just reached through one unified code path.
         var changed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var fullyChangedRepos = new HashSet<RepositoryId>();
-        foreach ((RepositoryId repositoryId, string _, RepositoryMaterialization materialization, string? previousCommit) in materializations)
+        if (descriptor.ForceReanalysis)
         {
-            if (previousCommit is null) { fullyChangedRepos.Add(repositoryId); continue; }
-            if (previousCommit == materialization.Commit.Value) continue;
-            if (materialization.ChangedFiles is null) { fullyChangedRepos.Add(repositoryId); continue; }
-            foreach (string file in materialization.ChangedFiles) changed.Add(Path.GetFileName(file));
+            // Bypasses the auto-diff entirely — every repository is treated as fully changed regardless of
+            // its actual commit, so the pruning loop below never prunes anything for this app. Distinct from
+            // SkipIfUnchanged, which operates one layer up (skips the whole run before materialization
+            // finishes); this only affects which artifacts get re-analyzed once the run is already underway.
+            foreach ((RepositoryId repositoryId, string _, RepositoryMaterialization _, string? _) in materializations)
+                fullyChangedRepos.Add(repositoryId);
+        }
+        else
+        {
+            foreach ((RepositoryId repositoryId, string _, RepositoryMaterialization materialization, string? previousCommit) in materializations)
+            {
+                if (previousCommit is null) { fullyChangedRepos.Add(repositoryId); continue; }
+                if (previousCommit == materialization.Commit.Value) continue;
+                if (materialization.ChangedFiles is null) { fullyChangedRepos.Add(repositoryId); continue; }
+                foreach (string file in materialization.ChangedFiles) changed.Add(Path.GetFileName(file));
+            }
         }
 
         bool incremental = previous is not null;
@@ -179,14 +202,35 @@ internal sealed class ExecutionPipeline : IAnalysisPipeline
         ValidationResult v1 = await _validation.ValidateAsync(sink.Discoveries, null, ct);
         foreach (Diagnostic d in v1.Diagnostics) sink.Report(d);
 
-        // 2. Incremental carry-forward: retain prior knowledge whose evidence was not invalidated.
-        List<KnowledgeNode> nodes = MergeNodes(previous, v1.Nodes, changed, incremental);
+        // Composite applications (descriptor.Children non-empty) pull in each child's latest committed
+        // snapshot — always fully replaced from the child's current state, never carried forward through
+        // the incremental invalidation path below. A child-owned node/relationship's Evidence never
+        // intersects THIS application's own changed-file set, so if it went through that path it would
+        // look permanently "not invalidated" even after the child actually deletes it. Only this
+        // application's own facts (identified by KnowledgeIdentity's "app:" root segment — see
+        // KnowledgeExtensions.OwningApplication) go through the existing carry-forward merge; leaf apps
+        // (Children empty) own every node in their previous snapshot, so this is a no-op for them.
+        (List<KnowledgeNode> childNodes, List<Relationship> childRelationships) = descriptor.Children.Count == 0
+            ? (new List<KnowledgeNode>(), new List<Relationship>())
+            : await CollectChildKnowledgeAsync(descriptor.Children, sink, ct);
+        IReadOnlyList<KnowledgeNode>? ownPreviousNodes = previous?.Nodes
+            .Where(n => n.Identity.OwningApplication() == request.Application.Value).ToList();
+        IReadOnlyList<Relationship>? ownPreviousRelationships = previous?.Relationships
+            .Where(r => r.From.OwningApplication() == request.Application.Value && r.To.OwningApplication() == request.Application.Value).ToList();
+
+        // 2. Incremental carry-forward: retain prior knowledge whose evidence was not invalidated. Child
+        // nodes are folded in as an additional "fresh" source (always wins over stale own-previous), which
+        // is exactly the desired "children always fully replaced" semantics for free.
+        List<KnowledgeNode> nodes = MergeNodes(ownPreviousNodes, v1.Nodes.Concat(childNodes).ToList(), changed, incremental);
         var known = nodes.Select(n => n.Identity).ToList();
 
-        // 3. Relationship Resolution — emits Discoveries that pass through the SAME validation gate.
+        // 3. Relationship Resolution — emits Discoveries that pass through the SAME validation gate. Runs
+        // over the FULL pool (own + every child's nodes), so cross-child relationships (e.g. one child's
+        // ApiCall matching another child's Endpoint) are discovered with zero resolver changes — resolvers
+        // are already app/repo-boundary-agnostic, matching purely by node Kind/properties.
         IReadOnlyList<RelationshipDiscovery> resolved = await _resolution.ResolveAsync(nodes, ct);
         ValidationResult v2 = await _validation.ValidateAsync(resolved.Cast<Discovery>().ToList(), known, ct);
-        List<Relationship> relationships = MergeRelationships(previous, v1.Relationships, v2.Relationships, nodes, changed, incremental);
+        List<Relationship> relationships = MergeRelationships(ownPreviousRelationships, v1.Relationships, v2.Relationships.Concat(childRelationships).ToList(), nodes, changed, incremental);
 
         // 4. Commit a new immutable Snapshot (append-only).
         Snapshot snapshot = await _knowledge.CommitAsync(request.Application, nodes, relationships, ct);
@@ -204,7 +248,11 @@ internal sealed class ExecutionPipeline : IAnalysisPipeline
         // comment-only edit, or an incremental run that pruned everything because nothing under it
         // actually changed): there's nothing new to say, so publishing would just be a wasted, zero-value
         // new version (and, once AI-authored, a wasted AI call for the changelog too).
-        if (diff is not null && diff.IsEmpty)
+        // ForceReanalysis overrides this: its whole purpose is "regenerate even though nothing looks
+        // changed" (e.g. after a projection/prompt-template change with no underlying Knowledge Model
+        // delta), so honoring the empty-diff skip here would silently defeat that intent — the changelog
+        // degrades gracefully to "No changes." in that case rather than inventing anything.
+        if (diff is not null && diff.IsEmpty && !descriptor.ForceReanalysis)
         {
             sink.Report(Diagnostic.Info("Publish skipped: Knowledge Model unchanged (no nodes or relationships added/removed).", PipelineSource));
         }
@@ -212,7 +260,7 @@ internal sealed class ExecutionPipeline : IAnalysisPipeline
         {
             try
             {
-                IReadOnlyList<ProjectionResult> projections = await _projections.RunAsync(snapshot, repositoryIds.Select(r => r.Value).ToList(), ct);
+                IReadOnlyList<ProjectionResult> projections = await _projections.RunAsync(snapshot, repositoryIds.Select(r => r.Value).ToList(), descriptor.Children, notes, ct);
                 List<ProjectionArtifact> pages = projections.SelectMany(p => p.Artifacts).ToList();
 
                 // Publish as a new, additive version — never overwrite or clear a prior one (filesystem or
@@ -221,7 +269,7 @@ internal sealed class ExecutionPipeline : IAnalysisPipeline
                 // reachable in the store so the Viewer can offer a version picker.
                 await PublishVersionAsync(request.Application.Value, pages, materializations, diff, ct);
 
-                await UpdateApplicationsIndexAsync(request.Application.Value, ct);
+                await UpdateApplicationsIndexAsync(request.Application.Value, descriptor.Children, ct);
                 pagesGenerated = pages.Count;
             }
             catch (Exception ex)
@@ -293,26 +341,28 @@ internal sealed class ExecutionPipeline : IAnalysisPipeline
     private static bool Invalidated(IReadOnlyList<Evidence> evidence, HashSet<string> changed) =>
         evidence.Any(e => e.Location is not null && changed.Contains(Path.GetFileName(e.Location.File)));
 
-    private static List<KnowledgeNode> MergeNodes(Snapshot? previous, IReadOnlyList<KnowledgeNode> fresh, HashSet<string> changed, bool incremental)
+    // Takes the previous NODE LIST directly (not a whole Snapshot) so a composite application can pass
+    // just its own-owned partition — see the ExecuteAsync call site for why children are excluded here.
+    private static List<KnowledgeNode> MergeNodes(IReadOnlyList<KnowledgeNode>? previousNodes, IReadOnlyList<KnowledgeNode> fresh, HashSet<string> changed, bool incremental)
     {
-        if (!incremental || previous is null) return fresh.ToList();
+        if (!incremental || previousNodes is null) return fresh.ToList();
         var byId = new Dictionary<KnowledgeIdentity, KnowledgeNode>();
-        foreach (KnowledgeNode n in previous.Nodes)
+        foreach (KnowledgeNode n in previousNodes)
             if (!Invalidated(n.Evidence, changed)) byId[n.Identity] = n; // carry forward untouched knowledge
         foreach (KnowledgeNode n in fresh) byId[n.Identity] = n;         // freshly analyzed wins
 
         return byId.Values.ToList();
     }
 
-    private static List<Relationship> MergeRelationships(Snapshot? previous, IReadOnlyList<Relationship> fresh1,
+    private static List<Relationship> MergeRelationships(IReadOnlyList<Relationship>? previousRelationships, IReadOnlyList<Relationship> fresh1,
         IReadOnlyList<Relationship> fresh2, IReadOnlyList<KnowledgeNode> nodes, HashSet<string> changed, bool incremental)
     {
         var known = new HashSet<KnowledgeIdentity>(nodes.Select(n => n.Identity));
         string Key(Relationship r) => $"{r.Type.Value}|{r.From.Value}|{r.To.Value}";
         var map = new Dictionary<string, Relationship>();
 
-        if (incremental && previous is not null)
-            foreach (Relationship r in previous.Relationships)
+        if (incremental && previousRelationships is not null)
+            foreach (Relationship r in previousRelationships)
                 if (!Invalidated(r.Evidence, changed) && known.Contains(r.From) && known.Contains(r.To))
                     map[Key(r)] = r;
 
@@ -321,6 +371,29 @@ internal sealed class ExecutionPipeline : IAnalysisPipeline
                 map[Key(r)] = r;
 
         return map.Values.ToList();
+    }
+
+    // For a composite application: pull each child's latest committed snapshot (never re-analyzed —
+    // just the child's own already-resolved Knowledge). A child with no snapshot yet (never run) is
+    // reported and skipped rather than failing the whole run; it picks up on the child's next completed run.
+    private async Task<(List<KnowledgeNode> Nodes, List<Relationship> Relationships)> CollectChildKnowledgeAsync(
+        IReadOnlyList<string> children, DiscoverySink sink, CancellationToken ct)
+    {
+        var nodes = new List<KnowledgeNode>();
+        var relationships = new List<Relationship>();
+        foreach (string childName in children)
+        {
+            Snapshot? childSnapshot = await _knowledge.GetSnapshotAsync(new ApplicationId(childName), ct);
+            if (childSnapshot is null)
+            {
+                sink.Report(Diagnostic.Warning($"Child application '{childName}' has no analyzed snapshot yet — skipped this run.", PipelineSource));
+                continue;
+            }
+            nodes.AddRange(childSnapshot.Nodes);
+            relationships.AddRange(childSnapshot.Relationships);
+        }
+
+        return (nodes, relationships);
     }
 
     private async Task<ExecutionResult> FinishAsync(AnalysisExecution execution, ExecutionRequest request, DiscoverySink sink,
@@ -437,12 +510,22 @@ internal sealed class ExecutionPipeline : IAnalysisPipeline
         var repoCommits = materializations
             .Select(m => new RepositoryCommitChange(m.RepositoryId.Value, m.PreviousCommit, m.Materialization.Commit.Value)).ToList();
 
+        // Composite-scale attribution — see Aip.Core.Domain.DiffGrouping. A leaf application's diff only
+        // ever has one owning application (itself), so PerApplicationImpact stays empty for it: "more than
+        // one owner" is the actual signal that this version change is a genuine composite rollup.
+        IReadOnlyList<DiffGrouping.ApplicationImpact> byApp = DiffGrouping.GroupByOwningApplication(diff);
+        IReadOnlyList<OwningApplicationImpact> perApplicationImpact = !DiffGrouping.IsCompositeImpact(diff, application) ? Array.Empty<OwningApplicationImpact>() : byApp
+            .Select(a => new OwningApplicationImpact(a.Application, a.AddedNodes.Count, a.RemovedNodes.Count, a.AddedRelationships.Count, a.RemovedRelationships.Count))
+            .ToList();
+        (IReadOnlyList<Relationship> addedIntegrations, IReadOnlyList<Relationship> removedIntegrations) = DiffGrouping.CrossApplicationRelationships(diff);
+
         var change = new DocumentVersionChange(
             application, versionNumber, previousVersionNumber,
             diff.AddedNodes.Count, diff.RemovedNodes.Count, diff.AddedRelationships.Count, diff.RemovedRelationships.Count,
             diff.AddedNodes.Select(NodeLabel).ToList(), diff.RemovedNodes.Select(NodeLabel).ToList(),
             diff.AddedRelationships.Select(RelationshipLabel).ToList(), diff.RemovedRelationships.Select(RelationshipLabel).ToList(),
-            repoCommits, summary, aiWritten, DateTimeOffset.UtcNow);
+            repoCommits, summary, aiWritten, DateTimeOffset.UtcNow,
+            perApplicationImpact, addedIntegrations.Select(RelationshipLabel).ToList(), removedIntegrations.Select(RelationshipLabel).ToList());
 
         await _versionChanges.RecordAsync(change, ct);
     }
@@ -463,7 +546,7 @@ internal sealed class ExecutionPipeline : IAnalysisPipeline
     // application, "_index" — see DocumentManifest/ApplicationsIndex), so a Document Viewer landing page
     // can list every documented app without enumerating the whole store. Batch/CI-CD runs are sequential
     // today, so a plain read-modify-write is safe; concurrent writers would need optimistic concurrency.
-    private async Task UpdateApplicationsIndexAsync(string applicationName, CancellationToken ct)
+    private async Task UpdateApplicationsIndexAsync(string applicationName, IReadOnlyList<string> children, CancellationToken ct)
     {
         string? existingJson = await _documentStore.ReadAsync(ApplicationsIndex.IndexApplication, ApplicationsIndex.FileName, ct);
         List<ApplicationIndexEntry> entries = new();
@@ -474,11 +557,47 @@ internal sealed class ExecutionPipeline : IAnalysisPipeline
         }
 
         entries.RemoveAll(e => e.Name == applicationName);
-        entries.Add(new ApplicationIndexEntry(applicationName, DocumentPaths.SlugifyApplication(applicationName)));
+        entries.Add(new ApplicationIndexEntry(applicationName, DocumentPaths.SlugifyApplication(applicationName), children));
 
         var index = new ApplicationsIndex(entries.OrderBy(e => e.Name).ToList());
         await _documentStore.WriteAsync(ApplicationsIndex.IndexApplication, ApplicationsIndex.FileName,
             JsonSerializer.Serialize(index, ManifestJsonOptions), "application/json", ct);
+    }
+
+    // README.md/CLAUDE.md at each repo's own root only (never a nested/recursive search — those files can
+    // exist anywhere and often aren't about the project as a whole), first file found per repo wins. This
+    // is the full, verbatim text — it ends up on its own dedicated "Notes" page (DocumentationProjection's
+    // NotesPage), so it should read completely, not a stub — the cap here is a generous sanity limit
+    // against something pathological (a misnamed generated file), not a content budget. A separate, much
+    // tighter cap is applied later, only to what actually gets sent to the AI (see Documentation.cs's
+    // TruncateForAi) — that budget has nothing to do with what a human reader sees on the Notes page.
+    // Returns null (not "") when nothing was found anywhere, so callers can tell "no notes" apart from "an
+    // empty notes section" and skip sending anything to the AI at all.
+    private const int MaxNotesBytesPerRepo = 65536;
+    private static readonly string[] NotesFileNames = { "README.md", "CLAUDE.md" };
+
+    private static string? ReadRepositoryNotes(
+        List<(RepositoryId RepositoryId, string Location, RepositoryMaterialization Materialization, string? PreviousCommit)> materializations)
+    {
+        var sections = new List<string>();
+        foreach ((RepositoryId repositoryId, string _, RepositoryMaterialization materialization, string? _) in materializations)
+        {
+            foreach (string fileName in NotesFileNames)
+            {
+                string path = Path.Combine(materialization.RootPath, fileName);
+                if (!File.Exists(path)) continue;
+                try
+                {
+                    string content = File.ReadAllText(path);
+                    if (content.Length > MaxNotesBytesPerRepo) content = content[..MaxNotesBytesPerRepo] + "\n…(truncated)";
+                    sections.Add($"### {repositoryId.Value} ({fileName})\n{content}");
+                }
+                catch (IOException) { /* unreadable file — skip, never fail the run over a doc file */ }
+                break; // first match per repo wins; don't also add the other candidate name
+            }
+        }
+
+        return sections.Count == 0 ? null : string.Join("\n\n", sections);
     }
 
     private static string DeriveRepositoryName(string location)

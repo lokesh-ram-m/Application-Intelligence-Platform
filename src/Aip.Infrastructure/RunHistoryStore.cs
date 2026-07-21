@@ -81,6 +81,11 @@ internal sealed class DocumentVersionChangeEntity
     public string Summary { get; set; } = "";
     public bool AiWritten { get; set; }
     public DateTimeOffset OccurredAt { get; set; }
+    // Per-sub-application breakdown + cross-sub-application integration deltas — empty ("[]") for an
+    // ordinary leaf application's version changes, matching every existing row via the column default.
+    public string PerApplicationImpactJson { get; set; } = "[]";
+    public string AddedIntegrationNamesJson { get; set; } = "[]";
+    public string RemovedIntegrationNamesJson { get; set; } = "[]";
 }
 
 internal sealed class SnapshotEntity
@@ -387,7 +392,10 @@ internal sealed class EfVersionChangeStore : IVersionChangeStore
             RepositoryCommitsJson = JsonSerializer.Serialize(change.RepositoryCommits, Json),
             Summary = change.Summary,
             AiWritten = change.AiWritten,
-            OccurredAt = change.OccurredAt
+            OccurredAt = change.OccurredAt,
+            PerApplicationImpactJson = JsonSerializer.Serialize(change.PerApplicationImpact, Json),
+            AddedIntegrationNamesJson = JsonSerializer.Serialize(change.AddedIntegrationNames, Json),
+            RemovedIntegrationNamesJson = JsonSerializer.Serialize(change.RemovedIntegrationNames, Json)
         });
         await db.SaveChangesAsync(ct);
     }
@@ -407,6 +415,9 @@ internal sealed class EfVersionChangeStore : IVersionChangeStore
             JsonSerializer.Deserialize<List<string>>(e.AddedRelationshipNamesJson, Json) ?? new(),
             JsonSerializer.Deserialize<List<string>>(e.RemovedRelationshipNamesJson, Json) ?? new(),
             JsonSerializer.Deserialize<List<RepositoryCommitChange>>(e.RepositoryCommitsJson, Json) ?? new(),
-            e.Summary, e.AiWritten, e.OccurredAt);
+            e.Summary, e.AiWritten, e.OccurredAt,
+            JsonSerializer.Deserialize<List<OwningApplicationImpact>>(e.PerApplicationImpactJson, Json) ?? new(),
+            JsonSerializer.Deserialize<List<string>>(e.AddedIntegrationNamesJson, Json) ?? new(),
+            JsonSerializer.Deserialize<List<string>>(e.RemovedIntegrationNamesJson, Json) ?? new());
     }
 }

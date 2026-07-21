@@ -26,7 +26,10 @@ internal sealed class ReactPlugin : IPlugin
         new ReactContextAnalyzer(),
         new ReactRouteAnalyzer(),
         new ReactRoleAnalyzer(),
+        new ReactRoleGateAnalyzer(),
+        new ReactDefaultRouteAnalyzer(),
         new ReactDataGridAnalyzer(),
+        new ReactAnalyticsChartAnalyzer(),
         new ReactFilterAnalyzer(),
         new ReactImportExportAnalyzer(),
         new ReactFormFieldAnalyzer(),
@@ -39,7 +42,7 @@ internal sealed class ReactPlugin : IPlugin
         Version: "0.1.0",
         SupportedArtifacts: new[] { "react-workspace" },
         Languages: new[] { "typescript" },
-        Capabilities: new[] { "UIComponent", "Hook", "ApiCall", "Context", "Route", "Role", "DataGrid", "Filter", "ImportExport", "FormField", "AuthProvider", "TokenStorage", "TokenAttachment" },
+        Capabilities: new[] { "UIComponent", "Hook", "ApiCall", "Context", "Route", "Role", "DataGrid", "AnalyticsChart", "Filter", "ImportExport", "FormField", "AuthProvider", "TokenStorage", "TokenAttachment" },
         Priority: 90,
         Dependencies: new[] { "aip.plugins.aspnetcore" });
 

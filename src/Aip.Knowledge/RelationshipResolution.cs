@@ -134,6 +134,39 @@ internal sealed class PublisherSubscriberResolver : IRelationshipResolver
 }
 
 /// <summary>
+/// Links an audit-log fact (see AuditLogAnalyzer, Aip.Plugins.AspNetCore) to the actual Entity node it
+/// names, by exact (case-insensitive) match against the Entity's own "name" property — the same kind of
+/// string-to-node matching ApiCallToEndpointResolver already does for verb/route, just for a different pair
+/// of Kinds. An audit fact with no matching Entity (e.g. a typo, or the entity type genuinely isn't
+/// analyzed in this run) is simply left unresolved rather than guessed at.
+/// </summary>
+internal sealed class AuditLogToEntityResolver : IRelationshipResolver
+{
+    public string Name => "auditlog-entity";
+
+    public Task<IReadOnlyList<RelationshipDiscovery>> ResolveAsync(IReadOnlyList<KnowledgeNode> nodes, CancellationToken ct = default)
+    {
+        var entities = nodes.Where(n => n.Kind.Value == "Entity").ToList();
+        var auditLogs = nodes.Where(n => n.Kind.Value == "AuditLog").ToList();
+        var results = new List<RelationshipDiscovery>();
+
+        foreach (KnowledgeNode audit in auditLogs)
+        {
+            string? entityType = audit.Prop("entityType");
+            if (entityType is null) continue;
+            KnowledgeNode? match = entities.FirstOrDefault(e => string.Equals(e.Prop("name"), entityType, StringComparison.OrdinalIgnoreCase));
+            if (match is null) continue;
+
+            results.Add(RelationshipDiscovery.Create(
+                RelationshipType.From("AUDITS"), audit.Identity, match.Identity,
+                new[] { ResolverHelp.Derive(audit, 0.7) }, new Confidence(0.7)));
+        }
+
+        return Task.FromResult<IReadOnlyList<RelationshipDiscovery>>(results);
+    }
+}
+
+/// <summary>
 /// Elevates cross-repository call mappings to repository-level dependencies (Cross-repo dependency):
 /// when a frontend ApiCall maps to a backend Endpoint, the calling repo DEPENDS_ON the serving repo.
 /// </summary>

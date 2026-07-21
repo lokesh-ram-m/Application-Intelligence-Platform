@@ -66,6 +66,26 @@ internal static class PromptTemplates
         "restate the same absence three ways to reach paragraph length. A short accurate section beats a " +
         "long vague one every time.";
 
+    // Shared by the three product-spec templates below (the only ones that ever receive {{notes}} — see
+    // DocumentationProjection.Page). {{notes}} is always present in values but resolves to an empty string
+    // when nothing was found, so this instruction is inert (nothing to cross-reference) on a page with no
+    // notes rather than needing its own conditional wording. Deliberately does NOT ask the AI to reproduce
+    // any of the notes text itself (verbatim or otherwise) — a long README pushed the AI's own response
+    // past its output length limit mid-generation when it was asked to transcribe "exactly as it reads",
+    // and even short of that failure mode, an LLM asked to reproduce text verbatim commonly paraphrases it
+    // anyway. The raw notes are instead appended as their own deterministic section by DocumentationProjection
+    // after this call returns — the AI's only job here is deciding what's corroborated.
+    private const string NotesInstruction =
+        "Below the grounded model you may also see project notes (a README or CLAUDE.md) — these are " +
+        "human-authored and may be stale, incomplete, or simply wrong, unlike the grounded model above. " +
+        "Cross-reference each claim in the notes against the grounded facts: where a claim is corroborated " +
+        "by something in the model, weave it into the relevant section naturally, in your own words. Where " +
+        "you cannot find support for a claim in the grounded facts, do not state it as fact and do not " +
+        "mention it at all — the raw notes are shown separately elsewhere on the page for reference, so " +
+        "your job is only to enrich the sections above with what you can actually corroborate. Never quote " +
+        "or reproduce the notes text itself. If no notes are present below, ignore this instruction " +
+        "entirely and do not mention their absence.";
+
     // The value passed as {{model}} is the deterministic page for this document; the AI rewrites it into
     // richer prose. Keys match the template names the DocumentationProjection asks for.
     private static readonly Dictionary<string, string> Templates = new()
@@ -79,15 +99,17 @@ internal static class PromptTemplates
             "Rewrite this into a product overview for '{{app}}' with sections '## What is {{app}}?', " +
             "'## The problem it solves', '## Who it's for', and '## Key value'. Business language only — no " +
             "class names, method names, routes, or entity/table names; describe capabilities the way a " +
-            "non-technical stakeholder would, not the code that implements them. Grounded source:\n{{model}}",
+            "non-technical stakeholder would, not the code that implements them. " + NotesInstruction +
+            " Grounded source:\n{{model}}{{notes}}",
         ["product-features"] =
             "Rewrite this into a features page for '{{app}}', describing each capability in plain language " +
             "grouped by area. Business language only — no class names, method names, routes, or entity/table " +
-            "names; describe what a user can DO, not which code does it. Grounded source:\n{{model}}",
+            "names; describe what a user can DO, not which code does it. " + NotesInstruction +
+            " Grounded source:\n{{model}}{{notes}}",
         ["product-use-cases"] =
             "Rewrite this into a use-cases page for '{{app}}', each a short scenario of who does what and why. " +
-            "Business language only — no class names, method names, routes, or entity/table names. " +
-            "Grounded source:\n{{model}}",
+            "Business language only — no class names, method names, routes, or entity/table names. " + NotesInstruction +
+            " Grounded source:\n{{model}}{{notes}}",
         ["tech-architecture"] =
             "Rewrite this architecture page for '{{app}}' with descriptive prose on layers, components, and how " +
             "they fit together. Keep the mermaid diagram and any tables exactly as-is. Grounded source:\n{{model}}",
@@ -190,7 +212,12 @@ internal static class PromptTemplates
             "transcribe the grounded list back out unchanged. Keep it to a few sentences or a short bulleted " +
             "list; this is a changelog, not a full page. If the changes are purely structural with no clear " +
             "practical framing (e.g. an internal rename), say so plainly rather than inventing a narrative. " +
-            "Grounded source:\n{{model}}",
+            "If the facts below are broken out per sub-application (## headings) and/or include an " +
+            "'Integrations' section, '{{app}}' is a composite application made of those sub-applications — " +
+            "preserve that structure rather than flattening it back into one undifferentiated list, describe " +
+            "how each sub-application's change affects '{{app}}' as a whole (not just that sub-application in " +
+            "isolation), and call out any new or removed integration between sub-applications explicitly, " +
+            "since that is the most important fact at this scale. Grounded source:\n{{model}}",
     };
 
     public static string Get(string name) => Templates.TryGetValue(name, out string? t) ? t : "{{model}}";

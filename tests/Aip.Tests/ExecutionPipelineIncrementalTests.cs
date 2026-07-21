@@ -8,7 +8,6 @@ using Aip.Host;
 using Aip.Infrastructure;
 using Aip.Registries;
 
-using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 
@@ -26,24 +25,6 @@ namespace Aip.Tests;
 public class ExecutionPipelineIncrementalTests
 {
     private static readonly IConfiguration EmptyConfig = new ConfigurationBuilder().Build();
-    private const string LocalSqlServer = "Server=localhost,1433;User Id=sa;Password=Aip_Local_Dev_2026!;TrustServerCertificate=True;";
-
-    private static string NewTestConnectionString(out string databaseName)
-    {
-        databaseName = "AipHistoryTest_" + Guid.NewGuid().ToString("N");
-
-        return $"{LocalSqlServer}Database={databaseName};";
-    }
-
-    private static async Task DropTestDatabaseAsync(string databaseName)
-    {
-        SqlConnection.ClearAllPools();
-        await using var master = new SqlConnection($"{LocalSqlServer}Database=master;");
-        await master.OpenAsync();
-        await using var cmd = new SqlCommand(
-            $"IF DB_ID('{databaseName}') IS NOT NULL BEGIN ALTER DATABASE [{databaseName}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{databaseName}]; END", master);
-        await cmd.ExecuteNonQueryAsync();
-    }
 
     private static string SolutionRoot()
     {
@@ -86,7 +67,7 @@ public class ExecutionPipelineIncrementalTests
         string frontend = Path.Combine(root, "samples", "frontend");
         string temp = Path.Combine(Path.GetTempPath(), "aip-test-" + Guid.NewGuid().ToString("N"));
         Environment.SetEnvironmentVariable("AIP_OUTPUT", temp);
-        string connectionString = NewTestConnectionString(out string databaseName);
+        string connectionString = TestSqlServer.NewConnectionString(out string databaseName);
         Environment.SetEnvironmentVariable("AIP_SQL_CONNECTION_STRING", connectionString);
 
         try
@@ -135,7 +116,7 @@ public class ExecutionPipelineIncrementalTests
         {
             // Runs even on assertion failure — otherwise a failing test leaks its throwaway database forever.
             if (Directory.Exists(temp)) Directory.Delete(temp, recursive: true);
-            await DropTestDatabaseAsync(databaseName);
+            await TestSqlServer.DropDatabaseAsync(databaseName);
         }
     }
 
@@ -146,7 +127,7 @@ public class ExecutionPipelineIncrementalTests
         string backend = Path.Combine(root, "samples", "backend");
         string temp = Path.Combine(Path.GetTempPath(), "aip-test-" + Guid.NewGuid().ToString("N"));
         Environment.SetEnvironmentVariable("AIP_OUTPUT", temp);
-        string connectionString = NewTestConnectionString(out string databaseName);
+        string connectionString = TestSqlServer.NewConnectionString(out string databaseName);
         Environment.SetEnvironmentVariable("AIP_SQL_CONNECTION_STRING", connectionString);
 
         try
@@ -185,7 +166,7 @@ public class ExecutionPipelineIncrementalTests
         finally
         {
             if (Directory.Exists(temp)) Directory.Delete(temp, recursive: true);
-            await DropTestDatabaseAsync(databaseName);
+            await TestSqlServer.DropDatabaseAsync(databaseName);
         }
     }
 
@@ -219,7 +200,7 @@ public class ExecutionPipelineIncrementalTests
         string temp = Path.Combine(Path.GetTempPath(), "aip-test-" + Guid.NewGuid().ToString("N"));
         string backend = CopySampleBackend(root, Path.Combine(temp, "backend"));
         Environment.SetEnvironmentVariable("AIP_OUTPUT", Path.Combine(temp, "output"));
-        string connectionString = NewTestConnectionString(out string databaseName);
+        string connectionString = TestSqlServer.NewConnectionString(out string databaseName);
         Environment.SetEnvironmentVariable("AIP_SQL_CONNECTION_STRING", connectionString);
 
         try
@@ -271,7 +252,144 @@ public class ExecutionPipelineIncrementalTests
         finally
         {
             if (Directory.Exists(temp)) Directory.Delete(temp, recursive: true);
-            await DropTestDatabaseAsync(databaseName);
+            await TestSqlServer.DropDatabaseAsync(databaseName);
+        }
+    }
+
+    // ---- composite applications ----
+
+    [Fact]
+    public async Task Composite_application_snapshot_is_the_union_of_its_children()
+    {
+        string root = SolutionRoot();
+        string backend = Path.Combine(root, "samples", "backend");
+        string frontend = Path.Combine(root, "samples", "frontend");
+        string temp = Path.Combine(Path.GetTempPath(), "aip-test-" + Guid.NewGuid().ToString("N"));
+        Environment.SetEnvironmentVariable("AIP_OUTPUT", temp);
+        string connectionString = TestSqlServer.NewConnectionString(out string databaseName);
+        Environment.SetEnvironmentVariable("AIP_SQL_CONNECTION_STRING", connectionString);
+
+        try
+        {
+            var scripted = new ScriptedRepositorySource();
+            var services = new ServiceCollection();
+            services.AddApplicationIntelligencePlatform(EmptyConfig);
+            services.AddSingleton<IRepositorySource>(scripted);
+            using ServiceProvider provider = services.BuildServiceProvider();
+            await provider.MigrateRunHistoryAsync();
+            var registry = provider.GetRequiredService<SeedableApplicationRegistry>();
+            registry.Register(new ApplicationDescriptor("Backend", new[] { backend }));
+            registry.Register(new ApplicationDescriptor("Frontend", new[] { frontend }));
+            registry.Register(new ApplicationDescriptor("Portal", Array.Empty<string>(), Children: new[] { "Backend", "Frontend" }));
+
+            var pipeline = provider.GetRequiredService<IAnalysisPipeline>();
+            var store = provider.GetRequiredService<IKnowledgeStore>();
+
+            // Children must run — and commit a snapshot — before the composite pulls them, exactly what
+            // PlatformRunner.TopologicalOrder guarantees for a real batch run.
+            scripted.Script(backend, "c1", null);
+            ExecutionResult backendRun = await pipeline.ExecuteAsync(new ExecutionRequest(new ApplicationId("Backend"), ExecutionMode.Local));
+            Assert.Equal(ExecutionOutcome.Success, backendRun.Outcome);
+            scripted.Script(frontend, "c1", null);
+            ExecutionResult frontendRun = await pipeline.ExecuteAsync(new ExecutionRequest(new ApplicationId("Frontend"), ExecutionMode.Local));
+            Assert.Equal(ExecutionOutcome.Success, frontendRun.Outcome);
+
+            ExecutionResult portalRun = await pipeline.ExecuteAsync(new ExecutionRequest(new ApplicationId("Portal"), ExecutionMode.Local));
+            Assert.Equal(ExecutionOutcome.Success, portalRun.Outcome);
+
+            Snapshot? backendSnapshot = await store.GetSnapshotAsync(new ApplicationId("Backend"));
+            Snapshot? frontendSnapshot = await store.GetSnapshotAsync(new ApplicationId("Frontend"));
+            Snapshot? portalSnapshot = await store.GetSnapshotAsync(new ApplicationId("Portal"));
+            Assert.NotNull(backendSnapshot);
+            Assert.NotNull(frontendSnapshot);
+            Assert.NotNull(portalSnapshot);
+
+            // Every one of the children's nodes made it into the composite's own pool — nothing lost, and
+            // nothing duplicated (the composite has no repos of its own, so its whole node count is exactly
+            // the union of what its children already had).
+            Assert.Equal(backendSnapshot!.Nodes.Count + frontendSnapshot!.Nodes.Count, portalSnapshot!.Nodes.Count);
+            Assert.Contains(portalSnapshot.Nodes, n => n.Kind.Value == "Controller");     // from Backend
+            Assert.Contains(portalSnapshot.Nodes, n => n.Kind.Value == "UIComponent");    // from Frontend
+        }
+        finally
+        {
+            if (Directory.Exists(temp)) Directory.Delete(temp, recursive: true);
+            await TestSqlServer.DropDatabaseAsync(databaseName);
+        }
+    }
+
+    [Fact]
+    public async Task Changing_a_child_cascades_a_new_version_to_the_composite_and_attributes_it_correctly()
+    {
+        string root = SolutionRoot();
+        string temp = Path.Combine(Path.GetTempPath(), "aip-test-" + Guid.NewGuid().ToString("N"));
+        string backend = CopySampleBackend(root, Path.Combine(temp, "backend"));
+        string frontend = Path.Combine(root, "samples", "frontend");
+        Environment.SetEnvironmentVariable("AIP_OUTPUT", Path.Combine(temp, "output"));
+        string connectionString = TestSqlServer.NewConnectionString(out string databaseName);
+        Environment.SetEnvironmentVariable("AIP_SQL_CONNECTION_STRING", connectionString);
+
+        try
+        {
+            var scripted = new ScriptedRepositorySource();
+            var services = new ServiceCollection();
+            services.AddApplicationIntelligencePlatform(EmptyConfig);
+            services.AddSingleton<IRepositorySource>(scripted);
+            using ServiceProvider provider = services.BuildServiceProvider();
+            await provider.MigrateRunHistoryAsync();
+            var registry = provider.GetRequiredService<SeedableApplicationRegistry>();
+            registry.Register(new ApplicationDescriptor("Backend", new[] { backend }));
+            registry.Register(new ApplicationDescriptor("Frontend", new[] { frontend }));
+            registry.Register(new ApplicationDescriptor("Portal", Array.Empty<string>(), Children: new[] { "Backend", "Frontend" }));
+
+            var pipeline = provider.GetRequiredService<IAnalysisPipeline>();
+            var documentStore = provider.GetRequiredService<IDocumentStore>();
+            var versionChanges = provider.GetRequiredService<IVersionChangeStore>();
+
+            scripted.Script(backend, "c1", null);
+            await pipeline.ExecuteAsync(new ExecutionRequest(new ApplicationId("Backend"), ExecutionMode.Local));
+            scripted.Script(frontend, "c1", null);
+            await pipeline.ExecuteAsync(new ExecutionRequest(new ApplicationId("Frontend"), ExecutionMode.Local));
+            await pipeline.ExecuteAsync(new ExecutionRequest(new ApplicationId("Portal"), ExecutionMode.Local));
+            Assert.NotNull(await documentStore.ReadAsync("Portal", "v1/product-specification/overview.md"));
+
+            // Rerun the composite with nothing upstream changed — no new version (diff-based skip holds for
+            // composites exactly like it does for leaf applications).
+            ExecutionResult noopPortalRun = await pipeline.ExecuteAsync(new ExecutionRequest(new ApplicationId("Portal"), ExecutionMode.Local));
+            Assert.Equal(ExecutionOutcome.Success, noopPortalRun.Outcome);
+            Assert.Null(await documentStore.ReadAsync("Portal", "v2/product-specification/overview.md"));
+
+            // A genuine structural change to Backend only.
+            await File.WriteAllTextAsync(Path.Combine(backend, "Controllers", "PingController.cs"), """
+                using Microsoft.AspNetCore.Mvc;
+
+                namespace ShopApi.Controllers;
+
+                [ApiController]
+                [Route("api/[controller]")]
+                public class PingController : ControllerBase
+                {
+                    [HttpGet]
+                    public string Get() => "pong";
+                }
+                """);
+            scripted.Script(backend, "c2", new[] { "PingController.cs" });
+            await pipeline.ExecuteAsync(new ExecutionRequest(new ApplicationId("Backend"), ExecutionMode.Local));
+
+            ExecutionResult portalRun2 = await pipeline.ExecuteAsync(new ExecutionRequest(new ApplicationId("Portal"), ExecutionMode.Local));
+            Assert.Equal(ExecutionOutcome.Success, portalRun2.Outcome);
+            Assert.NotNull(await documentStore.ReadAsync("Portal", "v2/product-specification/overview.md"));
+
+            DocumentVersionChange? change = await versionChanges.GetAsync("Portal", 2);
+            Assert.NotNull(change);
+            Assert.True(change!.NodesAdded > 0);
+            Assert.Contains(change.PerApplicationImpact, i => i.Application == "Backend" && i.NodesAdded > 0);
+            Assert.DoesNotContain(change.PerApplicationImpact, i => i.Application == "Frontend" && (i.NodesAdded > 0 || i.NodesRemoved > 0));
+        }
+        finally
+        {
+            if (Directory.Exists(temp)) Directory.Delete(temp, recursive: true);
+            await TestSqlServer.DropDatabaseAsync(databaseName);
         }
     }
 }

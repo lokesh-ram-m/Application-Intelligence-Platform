@@ -161,6 +161,19 @@ dotnet build Aip.slnx
 dotnet test  Aip.slnx
 ```
 
+Several tests exercise Run History/Knowledge Storage against a real SQL Server (a throwaway, randomly
+named database per test, dropped again when the test finishes) — no hardcoded server is baked into the
+tests, so they run unmodified against local Docker, a CI-provisioned container, or Azure SQL. Point them
+at whichever server they're allowed to create/drop databases on:
+
+```bash
+export AIP_TEST_SQL_SERVER="Server=localhost,1433;User Id=sa;Password=Aip_Local_Dev_2026!;TrustServerCertificate=True;"
+```
+
+(`AIP_SQL_CONNECTION_STRING`, if already set for running the app itself, works too — see **Local SQL
+Server (Docker)** below for the local default.) Missing entirely is a clear test failure, not a silent
+fallback to `localhost`.
+
 ## Run
 
 The platform analyzes an estate three ways. All three normalize to the same `ExecutionRequest` and flow

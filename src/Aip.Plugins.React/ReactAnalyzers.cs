@@ -301,6 +301,15 @@ public sealed class ReactRouteAnalyzer : IAnalyzer
         new(@"allowedRoles\s*=\s*\{\s*\[([^\]]*)\]\s*\}", RegexOptions.Compiled);
     private static readonly Regex RoleToken = new(@"(?:ROLES\.)?(\w+)", RegexOptions.Compiled);
 
+    // createBrowserRouter/createHashRouter([{ path, element, children }, ...]) — the object/data-router
+    // config style, invisible to the JSX <Route> regex above since there's no JSX at all. Each entry is
+    // matched up to the next "path:" or the end of the array, mirroring how RouteBlock bounds a JSX <Route>
+    // up to the next sibling — a flat scan, not a real nested-object parser, so parent/child route nesting
+    // isn't reconstructed, but every declared route (at any depth) is still found and never silently missed.
+    private static readonly Regex ObjectRouterCall = new(@"create(?:Browser|Hash)Router\s*\(", RegexOptions.Compiled);
+    private static readonly Regex ObjectRouteEntry =
+        new(@"path\s*:\s*[""']([^""']*)[""'][\s\S]*?(?=path\s*:\s*[""']|\]\s*\)|\]\s*;|$)", RegexOptions.Compiled);
+
     public string Name => "react-routes";
 
     public Task AnalyzeAsync(IAnalysisContext context, IDiscoverySink sink, CancellationToken ct = default)
@@ -308,31 +317,55 @@ public sealed class ReactRouteAnalyzer : IAnalyzer
         var model = (TypeScriptSemanticModel)context.Model;
         foreach (TsFile file in model.Files)
         {
-            if (!file.Text.Contains("react-router-dom", StringComparison.Ordinal)) continue;
-
-            foreach (Match m in RouteBlock.Matches(file.Text))
+            if (file.Text.Contains("react-router-dom", StringComparison.Ordinal))
             {
-                string path = m.Groups[1].Value;
-                string display = string.IsNullOrEmpty(path) ? "(index)" : path;
-                bool guarded = m.Value.Contains("ProtectedRoute", StringComparison.Ordinal);
-
-                var props = new List<(string, string)> { ("path", display), ("protected", guarded ? "yes" : "no") };
-                Match roles = AllowedRoles.Match(m.Value);
-                if (roles.Success)
+                foreach (Match m in RouteBlock.Matches(file.Text))
                 {
-                    string joined = string.Join(", ", RoleToken.Matches(roles.Groups[1].Value).Select(r => r.Groups[1].Value).Distinct());
-                    if (joined.Length > 0) props.Add(("roles", joined));
+                    string path = m.Groups[1].Value;
+                    string display = string.IsNullOrEmpty(path) ? "(index)" : path;
+                    bool guarded = m.Value.Contains("ProtectedRoute", StringComparison.Ordinal);
+
+                    var props = new List<(string, string)> { ("path", display), ("protected", guarded ? "yes" : "no") };
+                    Match roles = AllowedRoles.Match(m.Value);
+                    if (roles.Success)
+                    {
+                        string joined = string.Join(", ", RoleToken.Matches(roles.Groups[1].Value).Select(r => r.Groups[1].Value).Distinct());
+                        if (joined.Length > 0) props.Add(("roles", joined));
+                    }
+
+                    KnowledgeIdentity routeId = context.NodeId(Rx.Seg("route", display));
+                    Evidence ev = context.Evidence(file.Path, Rx.LineAt(file.Text, m.Index), $"path:{display}");
+                    sink.Add(NodeDiscovery.Create(routeId, NodeKind.From("Route"), new[] { ev }, Confidence.From(0.85), Rx.Props(props.ToArray())));
+
+                    foreach (string rendered in Rx.JsxTag.Matches(m.Value).Select(t => t.Groups[1].Value).Where(n => n != "Route").Distinct())
+                    {
+                        Evidence renderEv = context.Evidence(file.Path, Rx.LineAt(file.Text, m.Index), $"{display}->{rendered}");
+                        sink.Add(RelationshipDiscovery.Create(RelationshipType.From("RENDERS"),
+                            routeId, context.NodeId(Rx.Seg("component", rendered)), new[] { renderEv }, Confidence.From(0.6)));
+                    }
                 }
+            }
 
-                KnowledgeIdentity routeId = context.NodeId(Rx.Seg("route", display));
-                Evidence ev = context.Evidence(file.Path, Rx.LineAt(file.Text, m.Index), $"path:{display}");
-                sink.Add(NodeDiscovery.Create(routeId, NodeKind.From("Route"), new[] { ev }, Confidence.From(0.85), Rx.Props(props.ToArray())));
-
-                foreach (string rendered in Rx.JsxTag.Matches(m.Value).Select(t => t.Groups[1].Value).Where(n => n != "Route").Distinct())
+            if (ObjectRouterCall.IsMatch(file.Text))
+            {
+                foreach (Match m in ObjectRouteEntry.Matches(file.Text))
                 {
-                    Evidence renderEv = context.Evidence(file.Path, Rx.LineAt(file.Text, m.Index), $"{display}->{rendered}");
-                    sink.Add(RelationshipDiscovery.Create(RelationshipType.From("RENDERS"),
-                        routeId, context.NodeId(Rx.Seg("component", rendered)), new[] { renderEv }, Confidence.From(0.6)));
+                    string path = m.Groups[1].Value;
+                    string display = string.IsNullOrEmpty(path) ? "(index)" : path;
+                    bool guarded = m.Value.Contains("PrivateRoute", StringComparison.Ordinal)
+                        || m.Value.Contains("ProtectedRoute", StringComparison.Ordinal);
+
+                    KnowledgeIdentity routeId = context.NodeId(Rx.Seg("route", display));
+                    Evidence ev = context.Evidence(file.Path, Rx.LineAt(file.Text, m.Index), $"path:{display}");
+                    sink.Add(NodeDiscovery.Create(routeId, NodeKind.From("Route"), new[] { ev }, Confidence.From(0.75),
+                        Rx.Props(("path", display), ("protected", guarded ? "yes" : "no"))));
+
+                    foreach (string rendered in Rx.JsxTag.Matches(m.Value).Select(t => t.Groups[1].Value).Distinct())
+                    {
+                        Evidence renderEv = context.Evidence(file.Path, Rx.LineAt(file.Text, m.Index), $"{display}->{rendered}");
+                        sink.Add(RelationshipDiscovery.Create(RelationshipType.From("RENDERS"),
+                            routeId, context.NodeId(Rx.Seg("component", rendered)), new[] { renderEv }, Confidence.From(0.6)));
+                    }
                 }
             }
         }
@@ -366,6 +399,115 @@ public sealed class ReactRoleAnalyzer : IAnalyzer
                 Evidence ev = context.Evidence(file.Path, Rx.LineAt(file.Text, block.Index), name);
                 sink.Add(NodeDiscovery.Create(context.NodeId(Rx.Seg("role", name)),
                     NodeKind.From("Role"), new[] { ev }, Confidence.From(0.9), Rx.Props(("name", name), ("value", value))));
+            }
+        }
+
+        return Task.CompletedTask;
+    }
+}
+
+/// <summary>
+/// Detects a role→default-route mapping — a function like <c>getDefaultRoute(role)</c> that switches on a
+/// role value and returns each role's landing page. This is a distinct fact from a role GATING a route
+/// (see ReactRoleGateAnalyzer): it says where a role is sent BY DEFAULT, not what a role is restricted
+/// from — hence its own relationship type, ROUTES_TO, rather than reusing GATES.
+/// </summary>
+public sealed class ReactDefaultRouteAnalyzer : IAnalyzer
+{
+    private static readonly Regex DefaultRouteFunctionStart =
+        new(@"\b(?:function\s+)?(get\w*default\w*route\w*|default\w*route\w*for\w*)\s*[:=]?\s*(?:\([^)]*\)|\w+)?\s*(?:=>)?\s*\{", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex RoleRouteCase =
+        new(@"case\s+(?:ROLES\.)?(\w+)\s*:[\s\S]{0,120}?return\s+[`'""]([^`'""]+)[`'""]", RegexOptions.Compiled);
+
+    public string Name => "react-default-routes";
+
+    public Task AnalyzeAsync(IAnalysisContext context, IDiscoverySink sink, CancellationToken ct = default)
+    {
+        var model = (TypeScriptSemanticModel)context.Model;
+        foreach (TsFile file in model.Files)
+        {
+            foreach (Match start in DefaultRouteFunctionStart.Matches(file.Text))
+            {
+                int bodyStart = start.Index + start.Length - 1;
+                int bodyEnd = FindMatchingBrace(file.Text, bodyStart);
+                if (bodyEnd < 0) continue;
+                string body = file.Text[bodyStart..bodyEnd];
+
+                foreach (Match m in RoleRouteCase.Matches(body).DistinctBy(m => m.Groups[1].Value))
+                {
+                    string role = m.Groups[1].Value;
+                    string route = m.Groups[2].Value;
+                    int absoluteIndex = bodyStart + m.Index;
+                    Evidence ev = context.Evidence(file.Path, Rx.LineAt(file.Text, absoluteIndex), $"{role}->{route}");
+                    sink.Add(RelationshipDiscovery.Create(RelationshipType.From("ROUTES_TO"),
+                        context.NodeId(Rx.Seg("role", role)), context.NodeId(Rx.Seg("route", route)), new[] { ev }, Confidence.From(0.65)));
+                }
+            }
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private static int FindMatchingBrace(string text, int openBraceIndex)
+    {
+        int depth = 0;
+        for (int i = openBraceIndex; i < text.Length; i++)
+        {
+            if (text[i] == '{') depth++;
+            else if (text[i] == '}') { depth--; if (depth == 0) return i + 1; }
+        }
+
+        return -1;
+    }
+}
+
+/// <summary>
+/// Detects role/permission-gated UI — any component whose code calls a role-check-shaped function (a hook
+/// like <c>useUserRole</c>/<c>useUserPermissions</c>, or a helper like <c>hasAnyRole</c>/<c>hasRole</c>/
+/// <c>hasPermission</c>) is treated as gating whatever it renders. One detector covers both a small
+/// button-level guard (RoleGuard-style, wrapping one element) and a whole-app layout gate (Next.js
+/// app-guard-style, wrapping the entire page) — the same underlying pattern, just wrapping a different
+/// amount of markup. Emits Role→UIComponent (GATES), since a Role node on its own (see ReactRoleAnalyzer)
+/// has no edge today to what it actually restricts.
+/// </summary>
+public sealed class ReactRoleGateAnalyzer : IAnalyzer
+{
+    private static readonly Regex RoleCheckCall =
+        new(@"\b(?:use\w*Role\w*|use\w*Permission\w*|hasAnyRole|hasRole|hasPermission)\s*\(", RegexOptions.Compiled);
+    // Only genuinely role/permission-shaped tokens — ROLES.X (the established vocabulary convention, see
+    // ReactRouteAnalyzer) or a quoted "GROUP.NAME" literal (e.g. "ENTITY.ADMIN") — never a bare word, to
+    // avoid matching arbitrary unrelated string constants that happen to sit in the same file.
+    private static readonly Regex RoleToken = new(@"ROLES\.(\w+)|[""']([A-Z][A-Z_]*\.[A-Z][A-Z_]*)[""']", RegexOptions.Compiled);
+    // A file whose own name IS the hook/utility (useUserRole.ts, RoleUtils.ts, PermissionHelpers.ts) defines
+    // the role-check logic rather than consuming it to gate a component — it will always match RoleCheckCall
+    // (it names the very function being matched) and every such GATES relationship was observed to be
+    // rejected by Validation in practice ("neither endpoint is in Knowledge"), since there's no real
+    // UIComponent node with that name. Excluded up front rather than left to be silently discarded downstream.
+    private static readonly Regex DefinitionFileName = new(@"^use[A-Z]|Utils?$|Helpers?$|Service$", RegexOptions.Compiled);
+
+    public string Name => "react-role-gates";
+
+    public Task AnalyzeAsync(IAnalysisContext context, IDiscoverySink sink, CancellationToken ct = default)
+    {
+        var model = (TypeScriptSemanticModel)context.Model;
+        foreach (TsFile file in model.Files)
+        {
+            if (!RoleCheckCall.IsMatch(file.Text)) continue;
+
+            string component = Path.GetFileNameWithoutExtension(file.Path);
+            if (DefinitionFileName.IsMatch(component)) continue;
+
+            var roles = RoleToken.Matches(file.Text)
+                .Select(m => m.Groups[1].Success ? m.Groups[1].Value : m.Groups[2].Value)
+                .Distinct().Take(10).ToList();
+            if (roles.Count == 0) continue;
+
+            KnowledgeIdentity componentId = context.NodeId(Rx.Seg("component", component));
+            foreach (string role in roles)
+            {
+                Evidence ev = context.Evidence(file.Path, 1, $"{component}:{role}");
+                sink.Add(RelationshipDiscovery.Create(RelationshipType.From("GATES"),
+                    context.NodeId(Rx.Seg("role", role)), componentId, new[] { ev }, Confidence.From(0.6)));
             }
         }
 
@@ -434,6 +576,45 @@ public sealed class ReactDataGridAnalyzer : IAnalyzer
 }
 
 /// <summary>
+/// Detects analytics/KPI dashboard components — a chart-library import (recharts, Chart.js via
+/// react-chartjs-2, or the lower-level chart.js package itself) is a strong, low-noise signal that a
+/// component's whole purpose is presenting an analytics visualization, not just "a UIComponent". Without
+/// this, dashboard components are indistinguishable from any other component in the generated docs, losing
+/// the "this app has an analytics/reporting capability" fact entirely.
+/// </summary>
+public sealed class ReactAnalyticsChartAnalyzer : IAnalyzer
+{
+    private static readonly (string Import, string Library)[] ChartLibraries =
+    {
+        ("recharts", "recharts"),
+        ("react-chartjs-2", "Chart.js"),
+        ("chart.js", "Chart.js"),
+    };
+
+    public string Name => "react-analytics-charts";
+
+    public Task AnalyzeAsync(IAnalysisContext context, IDiscoverySink sink, CancellationToken ct = default)
+    {
+        var model = (TypeScriptSemanticModel)context.Model;
+        foreach (TsFile file in model.Files)
+        {
+            (string Import, string Library)? match = ChartLibraries.FirstOrDefault(l => file.Text.Contains($"\"{l.Import}\"", StringComparison.Ordinal) || file.Text.Contains($"'{l.Import}'", StringComparison.Ordinal));
+            if (match is null) continue;
+
+            string component = Path.GetFileNameWithoutExtension(file.Path);
+            Evidence ev = context.Evidence(file.Path, 1, component);
+            // Emitted alongside whatever ReactComponentAnalyzer already found for this file (a generic
+            // UIComponent), not instead of it — this adds the analytics-specific fact on top.
+            sink.Add(NodeDiscovery.Create(context.NodeId(Rx.Seg("analyticschart", component)),
+                NodeKind.From("AnalyticsChart"), new[] { ev }, Confidence.From(0.8),
+                Rx.Props(("name", component), ("library", match.Value.Library))));
+        }
+
+        return Task.CompletedTask;
+    }
+}
+
+/// <summary>
 /// Detects client-side filters via their <c>useState</c> declaration — any state variable whose name
 /// contains "filter" (e.g. <c>selectedStatusFilters</c>, <c>typeFilterOpen</c>) is grounded as a filter
 /// the UI exposes, named after the file it lives in.
@@ -442,6 +623,14 @@ public sealed class ReactFilterAnalyzer : IAnalyzer
 {
     private static readonly Regex FilterState =
         new(@"const\s*\[\s*(\w*[Ff]ilters?\w*)\s*,\s*set\w+\s*\]\s*=\s*useState", RegexOptions.Compiled);
+    // A tab-switch feeding a live view (e.g. "Under Allocated" / "Over Allocated" / "0% Allocation") is the
+    // same underlying capability as a filter — narrowing what's shown by a criterion the user picks — just
+    // presented as tabs instead of a filter control. Only counted when it also drives a fetch (a useEffect
+    // dependency array referencing the tab state, or an ApiCall inside the same handler), so an ordinary
+    // "which panel is open" UI tab doesn't get mistaken for a data-filtering one.
+    private static readonly Regex TabState =
+        new(@"const\s*\[\s*(\w*(?:[Tt]ab|[Vv]iew)\w*)\s*,\s*set\w+\s*\]\s*=\s*useState", RegexOptions.Compiled);
+    private static readonly Regex FetchSignal = new(@"\b(?:fetch|axios|api\w*\.(?:get|post))\s*\(", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     public string Name => "react-filters";
 
@@ -459,6 +648,16 @@ public sealed class ReactFilterAnalyzer : IAnalyzer
                     NodeKind.From("Filter"), new[] { ev }, Confidence.From(0.75),
                     Rx.Props(("name", field), ("component", component))));
             }
+
+            if (!FetchSignal.IsMatch(file.Text)) continue;
+            foreach (Match m in TabState.Matches(file.Text).DistinctBy(m => m.Groups[1].Value))
+            {
+                string field = m.Groups[1].Value;
+                Evidence ev = context.Evidence(file.Path, Rx.LineAt(file.Text, m.Index), field);
+                sink.Add(NodeDiscovery.Create(context.NodeId(Rx.Seg("filter", $"{component}:{field}")),
+                    NodeKind.From("Filter"), new[] { ev }, Confidence.From(0.6),
+                    Rx.Props(("name", field), ("component", component), ("kind", "view-tab"))));
+            }
         }
 
         return Task.CompletedTask;
@@ -474,6 +673,12 @@ public sealed class ReactImportExportAnalyzer : IAnalyzer
     private static readonly Regex Handler =
         new(@"(?:const|function)\s+(handle(Import|Export|Download|Upload)\w*)\b", RegexOptions.Compiled);
     private static readonly Regex FileInput = new(@"type\s*=\s*[""']file[""']", RegexOptions.Compiled);
+    // A second, reinforcing signal on the SAME node (not a new node/kind): a background job whose progress
+    // is polled — setInterval, a poll*-named identifier, or the job-status literals a status-polling loop
+    // typically switches on. Without this, a bulk-upload's real behavior (submit, then watch it finish
+    // asynchronously) reads identically to a synchronous one-shot import.
+    private static readonly Regex PollingSignal =
+        new(@"\bsetInterval\s*\(|\bpoll\w*\s*\(|[""'](?:Pending|Processing)[""']", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     public string Name => "react-importexport";
 
@@ -482,14 +687,16 @@ public sealed class ReactImportExportAnalyzer : IAnalyzer
         var model = (TypeScriptSemanticModel)context.Model;
         foreach (TsFile file in model.Files)
         {
+            bool polls = PollingSignal.IsMatch(file.Text);
             foreach (Match m in Handler.Matches(file.Text))
             {
                 string name = m.Groups[1].Value;
                 string kind = m.Groups[2].Value;
                 Evidence ev = context.Evidence(file.Path, Rx.LineAt(file.Text, m.Index), name);
+                var props = new List<(string, string)> { ("name", name), ("kind", kind) };
+                if (polls) props.Add(("async", "polls job status"));
                 sink.Add(NodeDiscovery.Create(context.NodeId(Rx.Seg("importexport", name)),
-                    NodeKind.From("ImportExport"), new[] { ev }, Confidence.From(0.8),
-                    Rx.Props(("name", name), ("kind", kind))));
+                    NodeKind.From("ImportExport"), new[] { ev }, Confidence.From(0.8), Rx.Props(props.ToArray())));
             }
 
             if (FileInput.IsMatch(file.Text) && !Handler.IsMatch(file.Text))
@@ -557,6 +764,16 @@ public sealed class ReactFormFieldAnalyzer : IAnalyzer
     private static readonly Regex ManualValidation =
         new(@"(?:newErrors|errors)\.(\w+)\s*=\s*[`'""]([^`'""]+)[`'""]", RegexOptions.Compiled);
 
+    // Broader manual-validation detection, scoped to a validation-shaped function's body only — a real
+    // form used a variable named `e` (not errors/newErrors) for the exact same pattern, which the regex
+    // above misses entirely since it's anchored to those two names. Widening the name match to "any
+    // identifier" file-wide would flag ordinary object-property assignment anywhere (config.name = "x"),
+    // so this stays bounded to inside a function whose own name reads as validation logic
+    // (validate*/handleSubmit*/checkForm*/onSubmit*) — the same guard the plan calls for.
+    private static readonly Regex ValidationFunctionStart =
+        new(@"\b(?:function\s+)?(validate\w*|handleSubmit\w*|checkForm\w*|onSubmit\w*)\s*[:=]?\s*(?:\([^)]*\)|\w+)?\s*(?:=>)?\s*\{", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex FieldErrorAssignment = new(@"\b\w+\.(\w+)\s*=\s*[`'""]([^`'""]+)[`'""]", RegexOptions.Compiled);
+
     public string Name => "react-formfields";
 
     public Task AnalyzeAsync(IAnalysisContext context, IDiscoverySink sink, CancellationToken ct = default)
@@ -584,8 +801,39 @@ public sealed class ReactFormFieldAnalyzer : IAnalyzer
                     NodeKind.From("FormField"), new[] { ev }, Confidence.From(0.8),
                     Rx.Props(("name", field), ("form", component), ("validation", message))));
             }
+
+            foreach (Match start in ValidationFunctionStart.Matches(file.Text))
+            {
+                int bodyStart = start.Index + start.Length - 1; // the '{' itself
+                int bodyEnd = FindMatchingBrace(file.Text, bodyStart);
+                if (bodyEnd < 0) continue;
+                string body = file.Text[bodyStart..bodyEnd];
+
+                foreach (Match m in FieldErrorAssignment.Matches(body).DistinctBy(m => m.Groups[1].Value))
+                {
+                    string field = m.Groups[1].Value;
+                    string message = m.Groups[2].Value;
+                    int absoluteIndex = bodyStart + m.Index;
+                    Evidence ev = context.Evidence(file.Path, Rx.LineAt(file.Text, absoluteIndex), field);
+                    sink.Add(NodeDiscovery.Create(context.NodeId(Rx.Seg("formfield", $"{component}:{field}")),
+                        NodeKind.From("FormField"), new[] { ev }, Confidence.From(0.65),
+                        Rx.Props(("name", field), ("form", component), ("validation", message))));
+                }
+            }
         }
 
         return Task.CompletedTask;
+    }
+
+    private static int FindMatchingBrace(string text, int openBraceIndex)
+    {
+        int depth = 0;
+        for (int i = openBraceIndex; i < text.Length; i++)
+        {
+            if (text[i] == '{') depth++;
+            else if (text[i] == '}') { depth--; if (depth == 0) return i + 1; }
+        }
+
+        return -1;
     }
 }

@@ -28,13 +28,49 @@ internal static class AppsFile
         AppsConfig cfg = deserializer.Deserialize<AppsConfig>(File.ReadAllText(configPath)) ?? new AppsConfig();
         string baseDir = Path.GetDirectoryName(Path.GetFullPath(configPath)) ?? Directory.GetCurrentDirectory();
 
-        return cfg.Applications
-            .Where(a => !string.IsNullOrWhiteSpace(a.Name))
+        List<AppEntry> entries = cfg.Applications.Where(a => !string.IsNullOrWhiteSpace(a.Name)).ToList();
+        ValidateChildren(entries);
+
+        return entries
             .Select(a => new ApplicationDescriptor(
                 a.Name,
                 a.Repos.Select(r => ResolveRepo(r, baseDir)).ToList(),
-                a.SkipIfUnchanged))
+                a.SkipIfUnchanged,
+                a.Children,
+                a.ForceReanalysis))
             .ToList();
+    }
+
+    // The single validation gate for composition: every referenced child must exist, and the
+    // Name -> Children graph must be acyclic (a composite can never, even transitively, contain itself).
+    // Nothing downstream (PlatformRunner's topological sort, ExecutionPipeline's child-snapshot pull-in)
+    // re-checks either invariant — they can assume a valid DAG.
+    private static void ValidateChildren(List<AppEntry> entries)
+    {
+        var byName = entries.ToDictionary(a => a.Name, a => a);
+        foreach (AppEntry entry in entries)
+            foreach (string child in entry.Children)
+                if (!byName.ContainsKey(child))
+                    throw new InvalidOperationException($"apps.yml: '{entry.Name}' declares child '{child}', which is not a declared application.");
+
+        var state = new Dictionary<string, int>(); // 0 = unvisited, 1 = in-progress (gray), 2 = done (black)
+        var path = new List<string>();
+        foreach (AppEntry entry in entries)
+            Visit(entry.Name, byName, state, path);
+    }
+
+    private static void Visit(string name, Dictionary<string, AppEntry> byName, Dictionary<string, int> state, List<string> path)
+    {
+        if (state.GetValueOrDefault(name) == 2) return;
+        if (state.GetValueOrDefault(name) == 1)
+            throw new InvalidOperationException($"apps.yml: cycle in application composition: {string.Join(" -> ", path.SkipWhile(n => n != name))} -> {name}");
+
+        state[name] = 1;
+        path.Add(name);
+        foreach (string child in byName[name].Children)
+            Visit(child, byName, state, path);
+        path.RemoveAt(path.Count - 1);
+        state[name] = 2;
     }
 
     // Git URLs pass through untouched; local paths are made absolute relative to the config file.
@@ -59,5 +95,11 @@ internal static class AppsFile
         // When true, a batch run skips this application entirely (no clone-and-analyze, no AI cost) if
         // every repository's current commit matches the last one recorded in Run History.
         public bool SkipIfUnchanged { get; set; } = false;
+        // Names of other applications declared in this same file whose Knowledge Models are merged into
+        // this one — see ApplicationDescriptor.Children.
+        public List<string> Children { get; set; } = new();
+        // When true, every repository is treated as fully changed regardless of its actual commit, so
+        // incremental pruning never skips an artifact — see ApplicationDescriptor.ForceReanalysis.
+        public bool ForceReanalysis { get; set; } = false;
     }
 }

@@ -12,9 +12,10 @@ internal sealed class ProjectionEngine : IProjectionEngine
 
     public ProjectionEngine(IEnumerable<IProjection> projections) => _projections = projections.ToList();
 
-    public async Task<IReadOnlyList<ProjectionResult>> RunAsync(Snapshot snapshot, IReadOnlyList<string>? repositories = null, CancellationToken ct = default)
+    public async Task<IReadOnlyList<ProjectionResult>> RunAsync(Snapshot snapshot, IReadOnlyList<string>? repositories = null,
+        IReadOnlyList<string>? children = null, string? notes = null, CancellationToken ct = default)
     {
-        var request = new ProjectionRequest(snapshot, repositories ?? Array.Empty<string>());
+        var request = new ProjectionRequest(snapshot, repositories ?? Array.Empty<string>(), children ?? Array.Empty<string>(), notes);
         var results = new List<ProjectionResult>();
         foreach (IProjection projection in _projections)
         {

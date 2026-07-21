@@ -8,6 +8,16 @@
 #   dotnet run --project src/Aip.Host -- run --config apps.yml   # one-off, for local testing
 #   dotnet run --project src/Aip.Host -- serve --config apps.yml # standalone, POST /run to trigger a run
 #                                                                 # (see README's "Deployment" section)
+#
+# Per-app flags (both default to false, preserving normal incremental behavior):
+#   skipIfUnchanged: true   — skip the whole app's run if every repo's commit is unchanged (saves the
+#                             clone/materialize step entirely).
+#   forceReanalysis: true   — the opposite knob, one layer deeper: even when a repo's commit HASN'T
+#                             changed, re-analyze every artifact in it from scratch instead of pruning
+#                             everything as "nothing to do". Useful right after deploying new/changed
+#                             analyzers, to pick up fresh facts from otherwise-unchanged code without
+#                             waiting for a real upstream commit. Remove it again once you've confirmed
+#                             the new facts landed — leaving it on defeats incremental analysis entirely.
 applications:
   - name: CleanArchitecture
     repos:
@@ -16,12 +26,24 @@ applications:
   - name: EntityManagement
     repos:
       - https://synergech@dev.azure.com/synergech/Synergech%20Internal%20Tools/_git/entity-management#main
+    forceReanalysis: true   # TEMPORARY — remove once you've confirmed the new analyzers picked up fresh facts
 
   - name: ProjectAllocation
     repos:
       - https://synergech@dev.azure.com/synergech/Synergech%20Internal%20Tools/_git/Project-Allocation
+    forceReanalysis: true   # TEMPORARY — remove once you've confirmed the new analyzers picked up fresh facts
 
   - name: CMS
     repos:
-      - https://synergech@dev.azure.com/synergech/Synergech%20Internal%20Tools/_git/cms-backend#develop
-      - https://synergech@dev.azure.com/synergech/Synergech%20Internal%20Tools/_git/cms-frontend#develop
+      - https://synergech@dev.azure.com/synergech/Synergech%20Internal%20Tools/_git/cms-backend#pre-develop
+      - https://synergech@dev.azure.com/synergech/Synergech%20Internal%20Tools/_git/cms-frontend#pre-develop
+    forceReanalysis: true   # TEMPORARY — remove once you've confirmed the new analyzers picked up fresh facts
+
+  # A composite application: no repos of its own, purely a rollup of the three above — its Knowledge
+  # Model is their union, its docs describe the whole thing including relationships between them (e.g. a
+  # CMS endpoint EntityManagement calls), and any change to a child's repo cascades a new version here too.
+  - name: NucleusPortal
+    children:
+      - EntityManagement
+      - CMS
+      - ProjectAllocation

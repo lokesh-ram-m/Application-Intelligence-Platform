@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Xml.Linq;
 
 using Aip.Abstractions.Analysis;
@@ -124,8 +125,9 @@ internal sealed class ControllerAnalyzer : IAnalyzer
             if (!isController) continue;
 
             string fq = Sym.Name(symbol);
+            SemanticModel sem = model.GetSemanticModel(decl.SyntaxTree);
             // Authorization and the [Route] template may be declared on a base controller — inherit both.
-            string? controllerAuth = Authorization(decl.AttributeLists) ?? InheritedAuthorization(symbol);
+            string? controllerAuth = Authorization(decl.AttributeLists, sem) ?? InheritedAuthorization(symbol);
             KnowledgeIdentity controllerId = context.NodeId(Sym.Seg("project", project), Sym.Seg("type", fq));
             var cprops = new List<(string, string)> { ("name", symbol.Name) };
             if (controllerAuth is not null) cprops.Add(("authorize", controllerAuth));
@@ -142,7 +144,7 @@ internal sealed class ControllerAnalyzer : IAnalyzer
                 actionTemplate ??= RouteTemplate(method.AttributeLists);
 
                 string route = ResolveRoute(symbol.Name, controllerTemplate, actionTemplate, method.Identifier.Text);
-                string? epAuth = Authorization(method.AttributeLists) ?? controllerAuth;
+                string? epAuth = Authorization(method.AttributeLists, sem) ?? controllerAuth;
                 KnowledgeIdentity endpointId = context.AppNodeId(Sym.Seg("endpoint", $"{verb} {route}"));
                 Evidence ev = context.Evidence(path, Sym.Line(method), method.Identifier.Text);
                 var eprops = new List<(string, string)> { ("verb", verb), ("route", route), ("action", method.Identifier.Text) };
@@ -225,7 +227,11 @@ internal sealed class ControllerAnalyzer : IAnalyzer
     }
 
     // Reads [Authorize]/[AllowAnonymous] into a short label: "AllowAnonymous", "Authorize", or "Authorize (Roles: …)".
-    private static string? Authorization(SyntaxList<AttributeListSyntax> lists)
+    // A Policy/Roles argument is very often a named constant (e.g. [Authorize(Policy = Roles.PolicyAdmin)])
+    // rather than a string literal — the semantic model's constant-value resolution handles that identically
+    // to a literal, so the real policy/role name is captured either way instead of silently dropping the
+    // property whenever the argument isn't written as an inline string.
+    private static string? Authorization(SyntaxList<AttributeListSyntax> lists, SemanticModel semanticModel)
     {
         var attrs = lists.SelectMany(a => a.Attributes).ToList();
         if (attrs.Any(a => a.Name.ToString().Split('.').Last() == "AllowAnonymous")) return "AllowAnonymous";
@@ -236,7 +242,8 @@ internal sealed class ControllerAnalyzer : IAnalyzer
         var details = new List<string>();
         foreach (AttributeArgumentSyntax arg in auth.ArgumentList?.Arguments ?? default)
         {
-            if (arg.Expression is not LiteralExpressionSyntax lit || lit.Token.Value is not string val) continue;
+            Optional<object?> constant = semanticModel.GetConstantValue(arg.Expression);
+            if (constant is not { HasValue: true, Value: string val }) continue;
             string? name = arg.NameEquals?.Name.Identifier.Text;
             details.Add(name == "Roles" ? $"Roles: {val}" : $"Policy: {val}");
         }
@@ -254,6 +261,73 @@ internal sealed class ControllerAnalyzer : IAnalyzer
         }
 
         return (null, null);
+    }
+
+    private static string? StringArg(AttributeSyntax a) =>
+        (a.ArgumentList?.Arguments.FirstOrDefault()?.Expression as LiteralExpressionSyntax)?.Token.ValueText;
+}
+
+/// <summary>
+/// Detects Azure Functions — a serverless entry point analogous to an HTTP <c>Endpoint</c>, but triggered
+/// by a queue message, timer, or raw HTTP call rather than routed ASP.NET Core request handling.
+/// <c>[Function("Name")]</c> (isolated-worker) or <c>[FunctionName("Name")]</c> (in-process) identifies the
+/// function; a trigger attribute (<c>[QueueTrigger]</c>/<c>[TimerTrigger]</c>/<c>[HttpTrigger]</c>/…) on one
+/// of its parameters identifies what invokes it — both hosting models use the same trigger attribute names,
+/// so one scan covers both. Without this, an entire serverless processing tier is invisible: it lives
+/// outside the MVC controller/endpoint pipeline every other analyzer here assumes.
+/// </summary>
+internal sealed class AzureFunctionAnalyzer : IAnalyzer
+{
+    public string Name => "azure-functions";
+
+    public Task AnalyzeAsync(IAnalysisContext context, IDiscoverySink sink, CancellationToken ct = default)
+    {
+        var model = (RoslynSemanticModel)context.Model;
+
+        foreach ((TypeDeclarationSyntax decl, INamedTypeSymbol symbol, _, string path) in Sym.Types(model))
+        {
+            if (symbol.TypeKind != TypeKind.Class) continue;
+            foreach (MethodDeclarationSyntax method in decl.Members.OfType<MethodDeclarationSyntax>())
+            {
+                string? functionName = FunctionName(method.AttributeLists);
+                if (functionName is null) continue;
+
+                string? trigger = TriggerDescription(method);
+                KnowledgeIdentity functionId = context.AppNodeId(Sym.Seg("function", functionName));
+                var props = new List<(string, string)> { ("name", functionName) };
+                if (trigger is not null) props.Add(("trigger", trigger));
+                Evidence ev = context.Evidence(path, Sym.Line(method), functionName);
+                sink.Add(NodeDiscovery.Create(functionId, NodeKind.From("AzureFunction"),
+                    new[] { ev }, Confidence.Full, Sym.Props(props.ToArray())));
+            }
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private static string? FunctionName(SyntaxList<AttributeListSyntax> lists)
+    {
+        AttributeSyntax? attr = lists.SelectMany(a => a.Attributes)
+            .FirstOrDefault(a => a.Name.ToString().Split('.').Last() is "Function" or "FunctionName");
+
+        return attr is null ? null : StringArg(attr);
+    }
+
+    private static string? TriggerDescription(MethodDeclarationSyntax method)
+    {
+        foreach (ParameterSyntax param in method.ParameterList.Parameters)
+        {
+            foreach (AttributeSyntax attr in param.AttributeLists.SelectMany(a => a.Attributes))
+            {
+                string n = attr.Name.ToString().Split('.').Last();
+                if (!n.EndsWith("Trigger", StringComparison.Ordinal)) continue;
+                string? detail = StringArg(attr);
+
+                return detail is null ? n : $"{n}:{detail}";
+            }
+        }
+
+        return null;
     }
 
     private static string? StringArg(AttributeSyntax a) =>
@@ -358,6 +432,154 @@ internal sealed class InterfaceAnalyzer : IAnalyzer
 
         return Task.CompletedTask;
     }
+}
+
+/// <summary>
+/// Detects audit/lifecycle logging call sites — e.g. <c>_audit.LogAsync("Contract", id, "Created", ...)</c>
+/// — a strong signal that an entity type has a tracked lifecycle (who did what, when to it), invisible to
+/// every other analyzer here since it's just an ordinary method call, not a framework registration or
+/// attribute. Recognized by shape, not any specific audit library: the receiver's own text contains "audit"
+/// and the invoked method's name contains "Log", with a string-literal first argument naming the audited
+/// entity type. Deduped per (class, entity type) — this grounds "this class audits entity X", not each
+/// individual action name, since <see cref="Relationship"/> has no property bag to carry that granularity.
+/// Resolved to the actual Entity node it names later by AuditLogToEntityResolver (see
+/// Aip.Knowledge/RelationshipResolution.cs) — this analyzer only grounds the raw fact.
+/// </summary>
+internal sealed class AuditLogAnalyzer : IAnalyzer
+{
+    public string Name => "audit-log";
+
+    public Task AnalyzeAsync(IAnalysisContext context, IDiscoverySink sink, CancellationToken ct = default)
+    {
+        var model = (RoslynSemanticModel)context.Model;
+        string project = context.Artifact.Name;
+
+        foreach ((TypeDeclarationSyntax decl, INamedTypeSymbol symbol, _, string path) in Sym.Types(model))
+        {
+            if (symbol.TypeKind != TypeKind.Class) continue;
+            var seen = new HashSet<string>();
+            foreach (InvocationExpressionSyntax inv in decl.DescendantNodes().OfType<InvocationExpressionSyntax>())
+            {
+                if (inv.Expression is not MemberAccessExpressionSyntax member) continue;
+                if (!member.Name.Identifier.Text.Contains("Log", StringComparison.Ordinal)) continue;
+                if (!member.Expression.ToString().Contains("audit", StringComparison.OrdinalIgnoreCase)) continue;
+                string? entityType = FirstStringLiteralArg(inv);
+                if (entityType is null || !seen.Add(entityType)) continue;
+
+                Evidence ev = context.Evidence(path, Sym.Line(inv), $"{symbol.Name}:{entityType}");
+                sink.Add(NodeDiscovery.Create(
+                    context.NodeId(Sym.Seg("project", project), Sym.Seg("auditlog", $"{symbol.Name}:{entityType}")),
+                    NodeKind.From("AuditLog"), new[] { ev }, Confidence.From(0.7),
+                    Sym.Props(("entityType", entityType), ("source", symbol.Name))));
+            }
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private static string? FirstStringLiteralArg(InvocationExpressionSyntax inv) =>
+        inv.ArgumentList.Arguments.Select(a => a.Expression).OfType<LiteralExpressionSyntax>()
+            .Select(l => l.Token.Value as string).FirstOrDefault(s => s is not null);
+}
+
+/// <summary>
+/// Detects a status/lifecycle "workflow" concept from repeated comparisons against the same *Status/*State
+/// -named member across a class — e.g. <c>EmploymentStatus == "Active"</c>, then <c>== "Inactive"</c>
+/// elsewhere in the same class. Scoped deliberately narrow: only a member whose name ends in Status/State
+/// AND is compared against at least two DISTINCT string literals within the same class counts — a single
+/// <c>==</c> check reads as an ordinary guard clause, not a workflow with real, enumerable states. Any
+/// looser than that risks flagging routine conditionals as a "business workflow" that isn't really one.
+/// </summary>
+internal sealed class StatusWorkflowAnalyzer : IAnalyzer
+{
+    private static readonly Regex StatusComparison =
+        new(@"\b(\w*(?:Status|State))\s*==\s*[""'](\w[\w\s-]*)[""']", RegexOptions.Compiled);
+
+    public string Name => "status-workflow";
+
+    public Task AnalyzeAsync(IAnalysisContext context, IDiscoverySink sink, CancellationToken ct = default)
+    {
+        var model = (RoslynSemanticModel)context.Model;
+        string project = context.Artifact.Name;
+
+        foreach ((TypeDeclarationSyntax decl, INamedTypeSymbol symbol, _, string path) in Sym.Types(model))
+        {
+            if (symbol.TypeKind != TypeKind.Class) continue;
+
+            var byProperty = StatusComparison.Matches(decl.ToString())
+                .GroupBy(m => m.Groups[1].Value)
+                .Where(g => g.Select(m => m.Groups[2].Value).Distinct(StringComparer.OrdinalIgnoreCase).Count() >= 2);
+
+            foreach (IGrouping<string, Match> group in byProperty)
+            {
+                string property = group.Key;
+                var values = group.Select(m => m.Groups[2].Value).Distinct(StringComparer.OrdinalIgnoreCase).Take(10).ToList();
+                Evidence ev = context.Evidence(path, Sym.Line(decl), $"{symbol.Name}.{property}");
+                sink.Add(NodeDiscovery.Create(
+                    context.NodeId(Sym.Seg("project", project), Sym.Seg("workflow", $"{symbol.Name}:{property}")),
+                    NodeKind.From("StatusWorkflow"), new[] { ev }, Confidence.From(0.6),
+                    Sym.Props(("name", property), ("owner", symbol.Name), ("values", string.Join(", ", values)))));
+            }
+        }
+
+        return Task.CompletedTask;
+    }
+}
+
+/// <summary>
+/// Detects manual business-rule/invariant validation — a hand-rolled <c>if (...) throw new
+/// InvalidOperationException("...")</c> guard, structurally identical in intent to what FluentValidation
+/// linkage already captures for validator classes, but never scanned for in plain Service/Manager methods.
+/// Scoped deliberately narrow (see Wave C risk note in the plan): only inside a method already named
+/// Validate*/Check*/Ensure*, inside a class already classified Service/Manager by naming convention — any
+/// looser than that would flag routine defensive null-checks as "business rules."
+/// </summary>
+internal sealed class BusinessRuleAnalyzer : IAnalyzer
+{
+    private static readonly HashSet<string> RuleExceptionTypes = new(StringComparer.Ordinal)
+        { "InvalidOperationException", "ValidationException", "ArgumentException" };
+
+    public string Name => "business-rules";
+
+    public Task AnalyzeAsync(IAnalysisContext context, IDiscoverySink sink, CancellationToken ct = default)
+    {
+        var model = (RoslynSemanticModel)context.Model;
+        string project = context.Artifact.Name;
+
+        foreach ((TypeDeclarationSyntax decl, INamedTypeSymbol symbol, _, string path) in Sym.Types(model))
+        {
+            if (symbol.TypeKind != TypeKind.Class) continue;
+            bool isServiceOrManager = symbol.Name.EndsWith("Service", StringComparison.Ordinal) || symbol.Name.EndsWith("Manager", StringComparison.Ordinal);
+            if (!isServiceOrManager) continue;
+
+            foreach (MethodDeclarationSyntax method in decl.Members.OfType<MethodDeclarationSyntax>())
+            {
+                if (!IsValidationShapedName(method.Identifier.Text)) continue;
+
+                foreach (ThrowStatementSyntax throwStmt in method.DescendantNodes().OfType<ThrowStatementSyntax>())
+                {
+                    if (throwStmt.Expression is not ObjectCreationExpressionSyntax creation) continue;
+                    string exceptionType = creation.Type.ToString().Split('.').Last();
+                    if (!RuleExceptionTypes.Contains(exceptionType)) continue;
+                    string? message = creation.ArgumentList?.Arguments.Select(a => a.Expression)
+                        .OfType<LiteralExpressionSyntax>().FirstOrDefault()?.Token.Value as string;
+                    if (message is null) continue;
+
+                    int line = Sym.Line(throwStmt);
+                    Evidence ev = context.Evidence(path, line, method.Identifier.Text);
+                    sink.Add(NodeDiscovery.Create(
+                        context.NodeId(Sym.Seg("project", project), Sym.Seg("businessrule", $"{symbol.Name}.{method.Identifier.Text}:{line}")),
+                        NodeKind.From("BusinessRule"), new[] { ev }, Confidence.From(0.6),
+                        Sym.Props(("rule", message), ("owner", symbol.Name), ("method", method.Identifier.Text))));
+                }
+            }
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private static bool IsValidationShapedName(string name) =>
+        name.StartsWith("Validate", StringComparison.Ordinal) || name.StartsWith("Check", StringComparison.Ordinal) || name.StartsWith("Ensure", StringComparison.Ordinal);
 }
 
 /// <summary>Detects entities semantically: data classes (properties only, no ordinary methods).</summary>

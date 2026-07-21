@@ -102,4 +102,11 @@ public static class KnowledgeExtensions
 
     public static string Label(this Relationship relationship) =>
         $"{relationship.Type.Value} {relationship.From.ShortName} → {relationship.To.ShortName}";
+
+    // The "app:" segment is always the root of a KnowledgeIdentity (see KnowledgeIdentity.ForApplication)
+    // and is stamped in at analysis time by whichever application originally analyzed the node — so for a
+    // composite application's pooled node set, this recovers "which application does this fact actually
+    // belong to" (itself, or a child it pulled a snapshot from) with no separate tracking needed.
+    public static string? OwningApplication(this KnowledgeIdentity identity) =>
+        identity.Segments.Count > 0 && identity.Segments[0].Kind == "app" ? identity.Segments[0].Value : null;
 }
