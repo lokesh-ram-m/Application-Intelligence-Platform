@@ -347,6 +347,10 @@ internal sealed class DocumentationProjection : IProjection
         AppendCrossCutting(sb, s);
         AppendMessaging(sb, s);
         AppendCqrs(sb, s);
+        AppendStatusWorkflows(sb, s);
+        AppendValidationRules(sb, s);
+        AppendBusinessRules(sb, s);
+        AppendAuditLogging(sb, s);
 
         var projects = Nodes(s, "Project").ToList();
         if (projects.Count > 0)
@@ -387,8 +391,166 @@ internal sealed class DocumentationProjection : IProjection
                 sb.AppendLine($"- `{Label(r.From)}` **{r.Type.Value}** `{Label(r.To)}`");
         }
 
+        AppendRequestFlows(sb, s);
+
         return sb.ToString();
     }
+
+    /// <summary>
+    /// Renders a handful of frontend→backend request flows as mermaid sequence diagrams — grounded entirely
+    /// in the same Component --CALLS--> ApiCall --MAPS_TO--> Endpoint chain already surfaced as prose in
+    /// FrontendComponents' "Backend calls (resolved)" section. Where the endpoint dispatches through a CQRS
+    /// mediator, the chain extends via independently-resolved semantic facts — Endpoint --DISPATCHES-->
+    /// Command/Query (MediatorDispatch, resolved from the actual `mediator.Send(request)` call site, not
+    /// constructor injection), Handler --HANDLES--> that same message (CqrsAnalyzer, from
+    /// IRequestHandler&lt;TReq,TRes&gt;), Handler --DEPENDS_ON--> EVERY in-source dependency it constructor-
+    /// injects (not just the first), and — for each of those dependencies — every DatabaseOperation call
+    /// site DatabaseOperationAnalyzer found inside that dependency's own methods (matched by owning class
+    /// name). Each hop is real; a chain simply stops extending wherever the next hop isn't resolved, rather
+    /// than guessing at what isn't there — the same discipline that keeps this project from fabricating
+    /// specifics it can't back up. Entity names reflect the C# type name captured at the call site (e.g.
+    /// "Order"), not necessarily the underlying table name — never pluralized or renamed to look more
+    /// database-like than what was actually resolved.
+    /// </summary>
+    private void AppendRequestFlows(StringBuilder sb, Snapshot s)
+    {
+        var apiCalls = Nodes(s, "ApiCall").ToDictionary(n => Label(n.Identity), n => n);
+        if (apiCalls.Count == 0) return;
+
+        var endpoints = Nodes(s, "Endpoint").ToDictionary(n => Label(n.Identity), n => n);
+        var mapsTo = s.Relationships.Where(r => r.Type.Value == "MAPS_TO")
+            .GroupBy(r => Label(r.From)).ToDictionary(g => g.Key, g => Label(g.First().To));
+        var dispatchesTo = s.Relationships.Where(r => r.Type.Value == "DISPATCHES")
+            .GroupBy(r => Label(r.From)).ToDictionary(g => g.Key, g => Label(g.First().To));
+        var handledBy = s.Relationships.Where(r => r.Type.Value == "HANDLES")
+            .GroupBy(r => Label(r.To)).ToDictionary(g => g.Key, g => Label(g.First().From));
+        var dependsOn = s.Relationships.Where(r => r.Type.Value == "DEPENDS_ON")
+            .GroupBy(r => Label(r.From)).ToDictionary(g => g.Key, g => g.Select(r => Label(r.To)).Distinct().ToList());
+        var dbOpsByOwner = Nodes(s, "DatabaseOperation").Where(n => (Prop(n, "owner") ?? "").Length > 0)
+            .GroupBy(n => Prop(n, "owner")!).ToDictionary(g => g.Key, g => g.ToList());
+
+        // One resolved chain per calling component (not per call) — a page/component that fires several
+        // calls to the same backend shouldn't crowd out the rest of the app from the diagram.
+        var chains = s.Relationships.Where(r => r.Type.Value == "CALLS" && apiCalls.ContainsKey(Label(r.To)))
+            .GroupBy(r => Label(r.From))
+            .Select(g => g.First())
+            .Where(r => mapsTo.ContainsKey(Label(r.To)) && endpoints.ContainsKey(mapsTo[Label(r.To)]))
+            .Select(r =>
+            {
+                string endpointLabel = mapsTo[Label(r.To)];
+                string? command = dispatchesTo.GetValueOrDefault(endpointLabel);
+                string? handler = command is not null ? handledBy.GetValueOrDefault(command) : null;
+                // Cap at 3 dependencies per handler — enough to show real fan-out (a handler that reads
+                // from one repository and writes through another) without the diagram/list ballooning for
+                // a handler with many unrelated constructor dependencies (loggers, mappers, ...).
+                var dependencies = handler is not null && dependsOn.TryGetValue(handler, out List<string>? deps)
+                    ? deps.Select(d => (Dependency: d, Operations: dbOpsByOwner.GetValueOrDefault(ShortType(d), new List<KnowledgeNode>())))
+                        .OrderByDescending(d => d.Operations.Count).Take(3).ToList()
+                    : new List<(string Dependency, List<KnowledgeNode> Operations)>();
+                return (Component: Label(r.From), ApiCall: apiCalls[Label(r.To)], Endpoint: endpoints[endpointLabel], Command: command, Handler: handler, Dependencies: dependencies);
+            })
+            .OrderBy(c => c.Component)
+            .Take(8)
+            .ToList();
+
+        // A single resolved chain isn't worth a diagram — the existing "Backend calls (resolved)" bullet
+        // list already says it plainly; a sequence diagram only earns its place once there's an actual
+        // sequence of distinct flows to show, per the "don't overuse mermaid" guidance.
+        if (chains.Count < 2) return;
+
+        bool anyCqrs = chains.Any(c => c.Handler is not null);
+        bool anyDbOps = chains.Any(c => c.Dependencies.Any(d => d.Operations.Count > 0));
+        sb.AppendLine("## Request flows\n");
+        sb.AppendLine("How the frontend's own resolved backend calls reach the API, grounded in the calls each component makes and the endpoint each one maps to." +
+            (anyCqrs ? " Where a call is dispatched through a CQRS mediator (`Send()`), the command/query and its handler are shown too — each hop resolved independently, not inferred." : "") +
+            (anyDbOps ? " Where a handler's own dependency has resolved database call sites, those are shown as well." : "") + "\n");
+        sb.AppendLine("```mermaid");
+        sb.AppendLine("sequenceDiagram");
+        sb.AppendLine("  actor User");
+        foreach (var c in chains) sb.AppendLine($"  participant {Safe(c.Component)} as {c.Component}");
+        sb.AppendLine("  participant API as Backend API");
+        var extraParticipants = new HashSet<string>();
+        bool dbParticipantAdded = false;
+        foreach (var c in chains)
+        {
+            if (c.Handler is not null && extraParticipants.Add(c.Handler))
+                sb.AppendLine($"  participant {Safe(c.Handler)} as {ShortType(c.Handler)}");
+            foreach ((string dependency, _) in c.Dependencies)
+                if (extraParticipants.Add(dependency))
+                    sb.AppendLine($"  participant {Safe(dependency)} as {ShortType(dependency)}");
+            if (!dbParticipantAdded && c.Dependencies.Any(d => d.Operations.Count > 0))
+            {
+                sb.AppendLine("  participant DB as Database");
+                dbParticipantAdded = true;
+            }
+        }
+        foreach (var c in chains)
+        {
+            string comp = Safe(c.Component);
+            string verb = Prop(c.ApiCall, "verb") ?? "GET";
+            string route = Prop(c.Endpoint, "route") ?? Label(c.Endpoint.Identity);
+            string owner = OwnerOf(s, c.Endpoint) is { } o ? $" ({o})" : "";
+            sb.AppendLine($"  User->>+{comp}: interacts");
+            sb.AppendLine($"  {comp}->>+API: {verb} {route}{owner}");
+            if (c.Handler is not null)
+            {
+                string handler = Safe(c.Handler);
+                sb.AppendLine($"  API->>+{handler}: {ShortType(c.Command!)}");
+                foreach ((string dependency, List<KnowledgeNode> operations) in c.Dependencies)
+                {
+                    string dep = Safe(dependency);
+                    sb.AppendLine($"  {handler}->>+{dep}: query/update");
+                    foreach (KnowledgeNode op in operations.Take(4))
+                        sb.AppendLine($"  {dep}->>DB: {DbOpLabel(op)}");
+                    sb.AppendLine($"  {dep}-->>-{handler}: data");
+                }
+                sb.AppendLine($"  {handler}-->>-API: result");
+            }
+            sb.AppendLine($"  API-->>-{comp}: response");
+            sb.AppendLine($"  {comp}-->>-User: update");
+        }
+        sb.AppendLine("```\n");
+
+        if (!anyDbOps) return;
+
+        // The same chains as a flat, scannable arrow list — a mermaid diagram is the right shape for
+        // showing message passing between participants, but it doesn't read as a quick "what does this
+        // endpoint actually do to the database" summary the way a plain list does.
+        sb.AppendLine("Database operations reached from each flow:\n");
+        foreach (var c in chains.Where(c => c.Dependencies.Any(d => d.Operations.Count > 0)))
+        {
+            string verb = Prop(c.ApiCall, "verb") ?? "GET";
+            string route = Prop(c.Endpoint, "route") ?? Label(c.Endpoint.Identity);
+            sb.AppendLine("```");
+            sb.AppendLine($"{verb} {route}");
+            sb.AppendLine($"→ {ShortType(c.Command!)}");
+            sb.AppendLine($"→ {ShortType(c.Handler!)}");
+            foreach ((string dependency, List<KnowledgeNode> operations) in c.Dependencies)
+            {
+                if (operations.Count == 0) continue;
+                sb.AppendLine($"→ {ShortType(dependency)}");
+                foreach (KnowledgeNode op in operations.Take(6)) sb.AppendLine($"  → {DbOpLabel(op)}");
+            }
+            sb.AppendLine("```\n");
+        }
+    }
+
+    // "READ Customer" / "INSERT Order" for entity-bearing operations; the raw method name (e.g.
+    // "SaveChangesAsync") for operations with no entity to anchor on (Persist/Transaction) — always the
+    // literal C# type/method name DatabaseOperationAnalyzer resolved, never pluralized or reworded to read
+    // more like a table name than what was actually captured.
+    private static string DbOpLabel(KnowledgeNode op)
+    {
+        string operation = Prop(op, "operation") ?? "";
+        string? entity = Prop(op, "entity");
+        return entity is { Length: > 0 } ? $"{operation.ToUpperInvariant()} {entity}" : Prop(op, "method") ?? operation;
+    }
+
+    // Strips a namespace-qualified type label (e.g. "TestApp.Commands.CreateThingCommand") down to its bare
+    // class name for a mermaid label — full qualification stays in the id (via Safe) to avoid collisions
+    // between same-named types in different namespaces, but the display text doesn't need the noise.
+    private static string ShortType(string qualified) =>
+        qualified.Contains('.') ? qualified[(qualified.LastIndexOf('.') + 1)..] : qualified;
 
     private string Api(Snapshot s, string app)
     {
@@ -401,10 +563,15 @@ internal sealed class DocumentationProjection : IProjection
         foreach (IGrouping<string, KnowledgeNode> group in endpoints.GroupBy(e => OwnerOf(s, e) ?? "General").OrderBy(g => g.Key))
         {
             sb.AppendLine($"### {group.Key}\n");
-            sb.AppendLine("| Method | Route | Description |");
-            sb.AppendLine("| --- | --- | --- |");
+            sb.AppendLine("| Method | Route | Description | Parameters | Returns |");
+            sb.AppendLine("| --- | --- | --- | --- | --- |");
             foreach (KnowledgeNode e in group.OrderBy(n => Prop(n, "route")))
-                sb.AppendLine($"| {Prop(e, "verb")} | `{Prop(e, "route")}` | {Operation(e)} |");
+            {
+                string parameters = Prop(e, "parameters") is { Length: > 0 } p
+                    ? string.Join(", ", p.Split("; ", StringSplitOptions.RemoveEmptyEntries).Select(x => $"`{x}`")) : "—";
+                string returns = Prop(e, "returns") is { Length: > 0 } r ? $"`{r}`" : "—";
+                sb.AppendLine($"| {Prop(e, "verb")} | `{Prop(e, "route")}` | {Operation(e)} | {parameters} | {returns} |");
+            }
             sb.AppendLine();
         }
 
@@ -489,14 +656,20 @@ internal sealed class DocumentationProjection : IProjection
         if (entities.Count > 0)
         {
             var entityRels = entities.ToDictionary(e => e.Identity,
-                e => s.Relationships.Where(r => r.From.Equals(e.Identity) && r.Type.Value is "HAS_MANY" or "REFERENCES").ToList());
+                e => s.Relationships.Where(r => r.From.Equals(e.Identity) && r.Type.Value is "HAS_MANY" or "REFERENCES" or "HAS_ONE" or "MANY_TO_MANY").ToList());
 
-            // A mermaid ER diagram from the same HAS_MANY/REFERENCES facts already used per-entity below —
-            // gives a reader the whole shape of the model at a glance before the entity-by-entity detail.
+            // A mermaid ER diagram from the same relationship facts already used per-entity below — gives a
+            // reader the whole shape of the model at a glance before the entity-by-entity detail. HAS_ONE/
+            // MANY_TO_MANY are the two cardinalities Fluent API's .WithOne()/.WithMany() follow-up actually
+            // distinguishes beyond the two conventional defaults (HAS_MANY/REFERENCES).
             var diagramEdges = entityRels.Values.SelectMany(r => r)
-                .Select(r => r.Type.Value == "HAS_MANY"
-                    ? $"    {SanitizeErName(Label(r.From))} ||--o{{ {SanitizeErName(Label(r.To))} : \"has many\""
-                    : $"    {SanitizeErName(Label(r.From))} }}o--|| {SanitizeErName(Label(r.To))} : \"references\"")
+                .Select(r => r.Type.Value switch
+                {
+                    "HAS_MANY" => $"    {SanitizeErName(Label(r.From))} ||--o{{ {SanitizeErName(Label(r.To))} : \"has many\"",
+                    "HAS_ONE" => $"    {SanitizeErName(Label(r.From))} ||--|| {SanitizeErName(Label(r.To))} : \"has one\"",
+                    "MANY_TO_MANY" => $"    {SanitizeErName(Label(r.From))} }}o--o{{ {SanitizeErName(Label(r.To))} : \"many to many\"",
+                    _ => $"    {SanitizeErName(Label(r.From))} }}o--|| {SanitizeErName(Label(r.To))} : \"references\"",
+                })
                 .Distinct().ToList();
             if (diagramEdges.Count > 0)
             {
@@ -520,6 +693,9 @@ internal sealed class DocumentationProjection : IProjection
                 string name = Prop(e, "name") ?? Label(e.Identity);
                 sb.AppendLine($"### {name}");
                 if (Prop(e, "key") is { } key) sb.AppendLine($"_Identified by `{key}`._\n");
+                if (Prop(e, "tableName") is { Length: > 0 } tableName) sb.AppendLine($"_Mapped to table `{tableName}`._\n");
+                if (Prop(e, "primaryKey") is { Length: > 0 } primaryKey) sb.AppendLine($"_Primary key: `{primaryKey}`._\n");
+                if (Prop(e, "indexedProperties") is { Length: > 0 } indexed) sb.AppendLine($"_Indexed: `{indexed}`._\n");
 
                 if (Prop(e, "fields") is { Length: > 0 } fields)
                 {
@@ -540,7 +716,10 @@ internal sealed class DocumentationProjection : IProjection
                 {
                     sb.AppendLine("Relationships:");
                     foreach (Relationship r in rels)
-                        sb.AppendLine($"- {(r.Type.Value == "HAS_MANY" ? "has many" : "references")} **{Label(r.To)}**");
+                    {
+                        string verb = r.Type.Value switch { "HAS_MANY" => "has many", "HAS_ONE" => "has one", "MANY_TO_MANY" => "has and belongs to many", _ => "references" };
+                        sb.AppendLine($"- {verb} **{Label(r.To)}**");
+                    }
                     sb.AppendLine();
                 }
 
@@ -616,7 +795,9 @@ internal sealed class DocumentationProjection : IProjection
                 string type = Prop(r, "type") is { Length: > 0 } t ? $" ({t})" : "";
                 string guard = Prop(r, "protected") == "yes" ? " · protected" : "";
                 string routeRoles = Prop(r, "roles") is { Length: > 0 } rr ? $" · roles: {rr}" : "";
-                sb.AppendLine($"- `{Prop(r, "path")}`{type}{guard}{routeRoles}");
+                string component = Prop(r, "component") is { Length: > 0 } c ? $" → `{c}`" : "";
+                string lazy = Prop(r, "loadChildren") is { Length: > 0 } lc ? $" · lazy-loads `{lc}`" : "";
+                sb.AppendLine($"- `{Prop(r, "path")}`{type}{guard}{routeRoles}{component}{lazy}");
             }
         }
 
@@ -629,9 +810,55 @@ internal sealed class DocumentationProjection : IProjection
                 foreach ((string role, List<string> endpoints) in access.OrderBy(kv => kv.Key))
                     sb.AppendLine($"- **{role}**: {string.Join(", ", endpoints)}");
             }
+
+            AppendUserJourney(sb, roles, routes);
         }
 
         return (sb.ToString(), true);
+    }
+
+    // A mermaid `journey` diagram used as the closest honest substitute for a UML use-case diagram — mermaid
+    // has no native use-case syntax, but `journey`'s role-grouped, ordered steps convey the same "who does
+    // what" idea. Each section is a Role; each step is a Route explicitly gated to that role, or a generic
+    // protected route with no role restriction (reachable by anyone signed in) — grounded in the same
+    // Route.roles/Route.protected data as the "Role → backend access" list above, not a walked or inferred
+    // path. Steps are ordered alphabetically by path, NOT a claimed click-through sequence — journey's
+    // native "score" field (1-5, meant for user-satisfaction ratings) has no grounded equivalent here, so
+    // every step uses the same flat, meaningless value rather than inventing a rating.
+    private void AppendUserJourney(StringBuilder sb, List<KnowledgeNode> roles, List<KnowledgeNode> routes)
+    {
+        var byRole = new Dictionary<string, List<string>>();
+        foreach (KnowledgeNode role in roles)
+        {
+            string? roleName = Prop(role, "name");
+            if (string.IsNullOrEmpty(roleName)) continue;
+
+            var paths = routes.Where(r =>
+                (Prop(r, "roles") is { Length: > 0 } rr && rr.Split(',').Select(t => t.Trim()).Contains(roleName))
+                || (Prop(r, "protected") == "yes" && string.IsNullOrEmpty(Prop(r, "roles"))))
+                .Select(r => Prop(r, "path")).Where(p => p is { Length: > 0 })
+                .Select(p => p!.Replace(':', '-')).Distinct().OrderBy(p => p).ToList();
+            if (paths.Count > 0) byRole[roleName] = paths;
+        }
+
+        // A single role with a single reachable route isn't a "journey" — nothing to justify a diagram over
+        // the plain-prose access list just above it.
+        if (byRole.Sum(kv => kv.Value.Count) < 2) return;
+
+        sb.AppendLine("\n## User journeys (by role)\n");
+        sb.AppendLine("Mermaid has no native use-case diagram — this journey view is the closest honest " +
+                      "substitute: each section is a role, each step a route it can reach. Steps are listed " +
+                      "alphabetically, not a claimed click order, and the diagram's built-in \"mood\" score " +
+                      "carries no meaning here (this project doesn't track user satisfaction).\n");
+        sb.AppendLine("```mermaid");
+        sb.AppendLine("journey");
+        sb.AppendLine("  title Reachable screens by role");
+        foreach ((string role, List<string> paths) in byRole.OrderBy(kv => kv.Key))
+        {
+            sb.AppendLine($"  section {role}");
+            foreach (string path in paths) sb.AppendLine($"    {path}: 3: {role}");
+        }
+        sb.AppendLine("```\n");
     }
 
     /// <summary>
@@ -688,7 +915,10 @@ internal sealed class DocumentationProjection : IProjection
     {
         var sb = new StringBuilder();
         var grids = Nodes(s, "DataGrid").ToList();
-        var filters = Nodes(s, "Filter").ToList();
+        // Backend MVC/endpoint filter TYPES share the "Filter" node kind by accident (see AppendCrossCutting)
+        // — only the frontend UI filter-state population carries a "component" property, so that's the gate
+        // that keeps a stray backend filter from showing up under a blank component heading here.
+        var filters = Nodes(s, "Filter").Where(n => Prop(n, "component") is not null).ToList();
         var importExport = Nodes(s, "ImportExport").ToList();
         var formFields = Nodes(s, "FormField").ToList();
         bool hasContent = grids.Count > 0 || filters.Count > 0 || importExport.Count > 0 || formFields.Count > 0;
@@ -705,7 +935,22 @@ internal sealed class DocumentationProjection : IProjection
         {
             sb.AppendLine("\n## Filters\n");
             foreach (IGrouping<string, KnowledgeNode> group in filters.GroupBy(f => Prop(f, "component") ?? "").OrderBy(g => g.Key))
-                sb.AppendLine($"- **{group.Key}**: {string.Join(", ", group.Select(f => Prop(f, "name")).OrderBy(n => n))}");
+            {
+                // Grouped by SHAPE, not dumped as raw variable names — and each entry prefers the traced
+                // targetField ("contractId") over the raw state name ("filterContractId") when one was found.
+                var singleValue = group.Where(f => Prop(f, "kind") is null or "single-value").Select(Describe).OrderBy(x => x).ToList();
+                var multiSelect = group.Where(f => Prop(f, "kind") == "multi-select").Select(Describe).OrderBy(x => x).ToList();
+                var tabs = group.Where(f => Prop(f, "kind") is "tab" or "view-tab").Select(Describe).OrderBy(x => x).ToList();
+
+                var parts = new List<string>();
+                if (singleValue.Count > 0) parts.Add($"filters by {string.Join(", ", singleValue)}");
+                if (multiSelect.Count > 0) parts.Add($"multi-select: {string.Join(", ", multiSelect)}");
+                if (tabs.Count > 0) parts.Add($"tabs: {string.Join(", ", tabs)}");
+
+                sb.AppendLine($"- **{group.Key}** — {string.Join("; ", parts)}");
+            }
+
+            static string Describe(KnowledgeNode f) => Prop(f, "targetField") is { Length: > 0 } tf ? tf : Prop(f, "name") ?? "";
         }
 
         if (importExport.Count > 0)
@@ -756,11 +1001,35 @@ internal sealed class DocumentationProjection : IProjection
             renders.TryGetValue(Prop(n, "name") ?? "", out List<string>? children) && children.Count > 0
                 ? $" · renders: {string.Join(", ", children)}" : "";
 
+        // Every incoming RENDERS edge, by target label. Deliberately NOT a full transitive-reachability
+        // walk from routes (which would risk false positives from analyzer gaps elsewhere — lazy-loaded
+        // routes, dynamic imports) — only flag a component with literally zero incoming edges from
+        // anywhere, the narrow, low-false-positive signal. Applied to plain components only, not pages: a
+        // page is almost always reached via a Route's own RENDERS edge, but an app's root/entry component
+        // is legitimately never rendered by anything else (it's mounted imperatively, not composed via
+        // JSX) — flagging pages too would risk mislabeling the single most important component in the app.
+        var renderedBySomething = s.Relationships.Where(r => r.Type.Value == "RENDERS")
+            .Select(r => Label(r.To)).ToHashSet();
+        string OrphanNote(KnowledgeNode n) =>
+            renderedBySomething.Contains(Prop(n, "name") ?? Label(n.Identity)) ? "" : " _(not rendered by anything else in the codebase)_";
+
+        // What a reader sees when there's genuinely nothing to show — grounded from the component's own
+        // "X.length === 0 ? ..." branch, not guessed. Only ever present when the analyzer found exactly
+        // one unambiguous empty-state conditional in that file (see ReactComponentAnalyzer).
+        string EmptyStateNote(KnowledgeNode n) =>
+            Prop(n, "emptyStateLabel") is { Length: > 0 } es ? $" · empty state: \"{es}\"" : "";
+
         if (pages.Count > 0)
         {
             sb.AppendLine("## Pages\n");
             foreach (KnowledgeNode p in pages.OrderBy(c => Prop(c, "name")))
-                sb.AppendLine($"- **{Prop(p, "name")}**{Rendering(p)}{HooksOf(p)}{Composes(p)}");
+            {
+                // The page's own on-screen heading, when unambiguous — the name a real user actually sees,
+                // which can genuinely differ from the technical component/export name (see the analyzer's
+                // own comment for why this is only ever extracted, never guessed by the AI).
+                string label = Prop(p, "displayName") is { Length: > 0 } dn ? $"**{dn}** (`{Prop(p, "name")}`)" : $"**{Prop(p, "name")}**";
+                sb.AppendLine($"- {label}{Rendering(p)}{HooksOf(p)}{Composes(p)}{EmptyStateNote(p)}");
+            }
             sb.AppendLine();
         }
 
@@ -770,7 +1039,7 @@ internal sealed class DocumentationProjection : IProjection
             foreach (KnowledgeNode c in comps.OrderBy(n => Prop(n, "name")))
             {
                 string selector = Prop(c, "selector") is { Length: > 0 } x ? $" (`{x}`)" : "";
-                sb.AppendLine($"- **{Prop(c, "name")}**{selector}{Rendering(c)}{PropsOf(c)}{HooksOf(c)}{Composes(c)}");
+                sb.AppendLine($"- **{Prop(c, "name")}**{selector}{Rendering(c)}{PropsOf(c)}{HooksOf(c)}{Composes(c)}{EmptyStateNote(c)}{OrphanNote(c)}");
             }
         }
 
@@ -813,12 +1082,16 @@ internal sealed class DocumentationProjection : IProjection
         Nodes(s, "Technology").Any(n => Prop(n, "category") is "Authentication" or "Security")
         || s.Nodes.Any(n => Prop(n, "authorize") is { } a && a != "AllowAnonymous")
         || Nodes(s, "AuthScheme").Any() || Nodes(s, "AuthProvider").Any()
-        || Nodes(s, "TokenStorage").Any() || Nodes(s, "TokenAttachment").Any();
+        || Nodes(s, "TokenStorage").Any() || Nodes(s, "TokenAttachment").Any()
+        || Nodes(s, "Configuration").Any(n => Prop(n, "name") == "Frontend deployment base path")
+        || Nodes(s, "Vulnerability").Any() || Nodes(s, "Cors").Any(n => Prop(n, "origins") == "any");
 
     private string Security(Snapshot s, string app)
     {
         var sb = new StringBuilder();
         sb.AppendLine($"# {app} — Security & Authentication\n");
+
+        AppendVulnerabilities(sb, s);
 
         sb.AppendLine("## Authentication\n");
         var auth = Nodes(s, "Technology").Where(n => Prop(n, "category") == "Authentication").DistinctBy(n => Prop(n, "name")).ToList();
@@ -906,9 +1179,10 @@ internal sealed class DocumentationProjection : IProjection
         }
 
         var authProviders = Nodes(s, "AuthProvider").DistinctBy(n => Prop(n, "name")).ToList();
-        var tokenStorage = Nodes(s, "TokenStorage").DistinctBy(n => Prop(n, "location")).ToList();
+        var tokenStorage = Nodes(s, "TokenStorage").ToList();
         var tokenAttachment = Nodes(s, "TokenAttachment").DistinctBy(n => Prop(n, "pattern")).ToList();
-        if (authProviders.Count > 0 || tokenStorage.Count > 0 || tokenAttachment.Count > 0)
+        var basePath = Nodes(s, "Configuration").FirstOrDefault(n => Prop(n, "name") == "Frontend deployment base path");
+        if (authProviders.Count > 0 || tokenStorage.Count > 0 || tokenAttachment.Count > 0 || basePath is not null)
         {
             sb.AppendLine("\n## Frontend authentication\n");
             if (authProviders.Count > 0)
@@ -921,7 +1195,19 @@ internal sealed class DocumentationProjection : IProjection
             if (tokenStorage.Count > 0)
             {
                 sb.AppendLine("\nWhere the frontend keeps the auth token client-side:");
-                foreach (KnowledgeNode t in tokenStorage) sb.AppendLine($"- **{Prop(t, "location")}**");
+                foreach (KnowledgeNode t in tokenStorage.DistinctBy(n => Prop(n, "location")))
+                    sb.AppendLine($"- **{Prop(t, "location")}**");
+
+                // A key that's only ever read (getItem evidence, never setItem, anywhere in this artifact)
+                // is a real, grounded signal that this app doesn't manage that token itself — something
+                // else (a parent shell app, a different part of the same deployment) must be writing it.
+                var readOnlyKeys = tokenStorage.Where(t => Prop(t, "operation") == "get" && Prop(t, "key") is { Length: > 0 }).ToList();
+                if (readOnlyKeys.Count > 0)
+                {
+                    sb.AppendLine("\nThe following key(s) are read from client-side storage but never written anywhere in this codebase — the value likely comes from outside this application:");
+                    foreach (KnowledgeNode t in readOnlyKeys)
+                        sb.AppendLine($"- `{Prop(t, "key")}` (in {Prop(t, "location")})");
+                }
             }
 
             if (tokenAttachment.Count > 0)
@@ -929,6 +1215,10 @@ internal sealed class DocumentationProjection : IProjection
                 sb.AppendLine("\nHow the token is attached to outgoing API requests:");
                 foreach (KnowledgeNode t in tokenAttachment) sb.AppendLine($"- **{Prop(t, "pattern")}**");
             }
+
+            if (basePath is not null)
+                sb.AppendLine($"\nThe frontend is built to be served from the sub-path `{Prop(basePath, "value")}`, not a domain root — " +
+                               "consistent with being embedded inside a larger portal/shell application rather than deployed standalone.");
         }
 
         return sb.ToString();
@@ -968,18 +1258,30 @@ internal sealed class DocumentationProjection : IProjection
             ("AuthScheme", "Authentication"), ("Authorization", "Authorization"), ("Cors", "CORS"),
             ("Cache", "Caching"), ("DataAccess", "Data access"), ("Messaging", "Messaging & events"),
             ("BackgroundJob", "Background jobs"), ("Resilience", "Resilience"), ("HealthCheck", "Health checks"),
-            ("Logging", "Logging & audit"), ("Validator", "Validation"), ("Filter", "Filters"),
+            ("Logging", "Logging & audit"), ("Validator", "Validation"),
         };
         var present = groups.Where(g => Nodes(s, g.Item1).Any()).ToList();
+        // Backend MVC/endpoint filter TYPES (authorization/action/exception/…) only — deliberately excluded
+        // from the generic flat-dump groups above and handled separately here, because "Filter" also covers
+        // an unrelated concept: frontend UI filter STATE (ReactFilterAnalyzer/AngularFilterAnalyzer), which
+        // already has its own proper per-component rendering on the Frontend page. Distinguished by the
+        // "component" property, which only the frontend population carries.
+        var mvcFilters = Nodes(s, "Filter").Where(n => Prop(n, "component") is null).ToList();
         var middleware = Nodes(s, "Middleware").OrderBy(n => int.TryParse(Prop(n, "order"), out int o) ? o : 0)
             .Select(n => Prop(n, "name")).Where(n => n is not null).Distinct().ToList();
-        if (present.Count == 0 && middleware.Count == 0) return;
+        if (present.Count == 0 && mvcFilters.Count == 0 && middleware.Count == 0) return;
 
         sb.AppendLine("## Cross-cutting concerns\n");
         foreach ((string kind, string heading) in present)
         {
             var names = Nodes(s, kind).Select(n => Prop(n, "name")).Where(n => n is not null).Distinct().ToList();
             sb.AppendLine($"- **{heading}:** {string.Join(", ", names)}");
+        }
+        if (mvcFilters.Count > 0)
+        {
+            var byKind = mvcFilters.GroupBy(n => Prop(n, "kind") ?? "other").OrderBy(g => g.Key)
+                .Select(g => $"{g.Key} ({string.Join(", ", g.Select(n => Prop(n, "name")).OrderBy(n => n))})");
+            sb.AppendLine($"- **Request filters:** {string.Join(", ", byKind)}");
         }
         if (middleware.Count > 0)
             sb.AppendLine($"- **Request pipeline:** {string.Join(" → ", middleware)}");
@@ -1031,6 +1333,114 @@ internal sealed class DocumentationProjection : IProjection
         if (events.Count > 0) sb.AppendLine($"**Events:** {string.Join(", ", events.Select(n => Prop(n, "name")).Take(40))}\n");
     }
 
+    // Status/lifecycle workflows detected via repeated comparisons against the same *Status/*State member
+    // (see StatusWorkflowAnalyzer). Deliberately rendered as a flat list of known states, NOT a mermaid
+    // stateDiagram-v2: the analyzer only ever sees which literal values a property is compared against,
+    // never the order code transitions between them — that would require tracking assignments across the
+    // whole call graph, which this analyzer doesn't do. Drawing arrows between states would fabricate a
+    // flow that was never actually observed, the same category of mistake already fixed elsewhere.
+    private void AppendStatusWorkflows(StringBuilder sb, Snapshot s)
+    {
+        var workflows = Nodes(s, "StatusWorkflow").ToList();
+        if (workflows.Count == 0) return;
+
+        sb.AppendLine("## Status workflows\n");
+        sb.AppendLine("Properties whose value is checked against multiple distinct states in the code. The " +
+                      "states themselves are grounded in those comparisons, but the order transitions happen " +
+                      "in can't be determined from static analysis alone, so no transition flow is shown.\n");
+        foreach (KnowledgeNode w in workflows.OrderBy(n => Prop(n, "owner")).ThenBy(n => Prop(n, "name")))
+        {
+            var states = (Prop(w, "values") ?? "").Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+            sb.AppendLine($"- **{Prop(w, "owner")}.{Prop(w, "name")}** — states: {string.Join(", ", states.Select(x => $"`{x}`"))}");
+        }
+        sb.AppendLine();
+    }
+
+    // ValidatorAnalyzer already parses each RuleFor(x => x.Field).Constraint1().Constraint2() chain into a
+    // "rules" property (see ArchitectureAnalyzers.cs), but nothing ever rendered that content — the
+    // cross-cutting concerns block above only lists validator class NAMES. This is the one place the actual
+    // field-level constraints are shown.
+    private void AppendValidationRules(StringBuilder sb, Snapshot s)
+    {
+        var validators = Nodes(s, "Validator").Where(n => Prop(n, "rules") is { Length: > 0 }).ToList();
+        if (validators.Count == 0) return;
+
+        sb.AppendLine("## Validation rules\n");
+        foreach (KnowledgeNode v in validators.OrderBy(n => Prop(n, "name")))
+        {
+            sb.AppendLine($"**{Prop(v, "name")}**");
+            foreach (string rule in (Prop(v, "rules") ?? "").Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+                sb.AppendLine($"- {rule}");
+            sb.AppendLine();
+        }
+    }
+
+    // BusinessRuleAnalyzer captures hand-rolled guard-clause invariants (if (...) throw new
+    // InvalidOperationException("...")) inside Service/Manager methods — grounded in the exact exception
+    // message thrown, never rendered anywhere until now.
+    private void AppendBusinessRules(StringBuilder sb, Snapshot s)
+    {
+        var rules = Nodes(s, "BusinessRule").ToList();
+        if (rules.Count == 0) return;
+
+        sb.AppendLine("## Business rules\n");
+        sb.AppendLine("Guard-clause invariants enforced in code, grouped by the type that owns them:\n");
+        foreach (IGrouping<string, KnowledgeNode> group in rules.GroupBy(n => Prop(n, "owner") ?? "").OrderBy(g => g.Key))
+        {
+            sb.AppendLine($"**{group.Key}**");
+            foreach (KnowledgeNode r in group.OrderBy(n => Prop(n, "method")))
+                sb.AppendLine($"- `{Prop(r, "method")}` — {Prop(r, "rule")}");
+            sb.AppendLine();
+        }
+    }
+
+    // AuditLogAnalyzer captures calls into something audit-log-shaped (a member whose owning expression
+    // reads as "audit", invoked with a *Log method) along with the entity type it logs about.
+    private void AppendAuditLogging(StringBuilder sb, Snapshot s)
+    {
+        var logs = Nodes(s, "AuditLog").ToList();
+        if (logs.Count == 0) return;
+
+        sb.AppendLine("## Audit logging\n");
+        var byEntity = logs.GroupBy(n => Prop(n, "entityType") ?? "").OrderBy(g => g.Key);
+        foreach (IGrouping<string, KnowledgeNode> group in byEntity)
+        {
+            var sources = group.Select(n => Prop(n, "source")).Where(x => x is not null).Distinct().OrderBy(x => x);
+            sb.AppendLine($"- **{group.Key}** — logged by {string.Join(", ", sources)}");
+        }
+        sb.AppendLine();
+    }
+
+    // Placed at the top of the Security page, not folded into a conditional block further down — these
+    // are actionable findings someone should act on, not background description of how the app is built,
+    // so they get priority placement over the rest of the page's descriptive content.
+    private void AppendVulnerabilities(StringBuilder sb, Snapshot s)
+    {
+        var findings = Nodes(s, "Vulnerability").ToList();
+        var openCors = Nodes(s, "Cors").Where(n => Prop(n, "origins") == "any").ToList();
+        if (findings.Count == 0 && openCors.Count == 0) return;
+
+        sb.AppendLine("## Vulnerabilities\n");
+
+        if (findings.Count > 0)
+        {
+            sb.AppendLine("Credential-shaped values found in plaintext in this repository's own config/pipeline " +
+                          "files — this only reflects the current snapshot being analyzed, not full git history, " +
+                          "so a secret since removed from the latest commit won't appear here. The value itself " +
+                          "is never shown; rotate the credential and remove it from source regardless.\n");
+            foreach (KnowledgeNode f in findings.OrderBy(n => Prop(n, "file")))
+                sb.AppendLine($"- **{Prop(f, "key")}** in `{Prop(f, "file")}` — _{Prop(f, "severity")} severity, {Prop(f, "type")}_");
+            sb.AppendLine();
+        }
+
+        if (openCors.Count > 0)
+        {
+            sb.AppendLine("This application configures a CORS policy that allows requests from **any origin** " +
+                          "(`AllowAnyOrigin`), rather than a fixed allow-list — worth confirming this is " +
+                          "intentional for a public API and not left over from local development.\n");
+        }
+    }
+
     // ======================= helpers =======================
 
     private static string RoleOf(string kind) => kind switch
@@ -1074,6 +1484,7 @@ internal sealed class DocumentationProjection : IProjection
         "DataAccess" => "A data-access approach (EF Core, Dapper, ADO.NET, MongoDB, …).",
         "Filter" => "An MVC filter (authorization / action / exception / result).",
         "Resilience" => "A resilience policy (retry, circuit-breaker).",
+        "Vulnerability" => "A security finding — e.g. a hardcoded credential detected in a config or pipeline file.",
         _ => "A tracked element of the application.",
     };
 

@@ -1,0 +1,42 @@
+# Builds and deploys Aip.Viewer (the reader) to the dev App Service. Aip.Host isn't covered here — it
+# doesn't run as a plain web app the same way, and hasn't got a deployment target yet.
+trigger:
+  branches:
+    include:
+      - develop
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  buildConfiguration: 'Release'
+  publishOutputDir: '$(Build.ArtifactStagingDirectory)/publish'
+
+steps:
+  - task: UseDotNet@2
+    displayName: 'Install .NET 10 SDK'
+    inputs:
+      packageType: 'sdk'
+      version: '10.x'
+
+  # Publishing just this one project's .csproj also restores/builds everything it references
+  # (Aip.Abstractions, Aip.Infrastructure, Aip.Core) — never Aip.Host or the analyzer plugins, which
+  # Aip.Viewer has no dependency on. zipAfterPublish packages the output the way AzureWebApp@1 expects it.
+  - task: DotNetCoreCLI@2
+    displayName: 'Publish Aip.Viewer'
+    inputs:
+      command: 'publish'
+      publishWebProjects: false
+      projects: 'src/Aip.Viewer/Aip.Viewer.csproj'
+      arguments: '--configuration $(buildConfiguration) --output $(publishOutputDir)'
+      zipAfterPublish: true
+
+  # azureSubscription references the existing, org-shared service connection (already scoped to
+  # SYN-LAB-SUB) rather than one created for this project specifically — see docs/deployment-notes.md.
+  - task: AzureWebApp@1
+    displayName: 'Deploy to Azure App Service (dev)'
+    inputs:
+      azureSubscription: 'sc-az-syn-azdevops-infra-lab-Synergech Co-Lab'
+      appType: 'webAppLinux'
+      appName: 'app-docsynth-viewer-dev'
+      package: '$(publishOutputDir)/**/*.zip'

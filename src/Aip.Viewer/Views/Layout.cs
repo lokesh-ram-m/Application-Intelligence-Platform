@@ -14,7 +14,7 @@ internal static class Layout
         </div>
         """;
 
-    // Synergech theme: navy primary, warm gold accent, white/near-white surfaces. One shared palette so the
+    // Brand theme: navy primary, warm gold accent, white/near-white surfaces. One shared palette so the
     // landing page and doc pages never drift apart visually.
     internal static string Theme() => """
         :root {

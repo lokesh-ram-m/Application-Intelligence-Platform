@@ -15,6 +15,7 @@
     <Project Path="src/Aip.Plugins.AspNetCore/Aip.Plugins.AspNetCore.csproj" />
     <Project Path="src/Aip.Plugins.NextJs/Aip.Plugins.NextJs.csproj" />
     <Project Path="src/Aip.Plugins.React/Aip.Plugins.React.csproj" />
+    <Project Path="src/Aip.Plugins.Security/Aip.Plugins.Security.csproj" />
     <Project Path="src/Aip.Projections/Aip.Projections.csproj" />
     <Project Path="src/Aip.Query/Aip.Query.csproj" />
     <Project Path="src/Aip.Registries/Aip.Registries.csproj" />

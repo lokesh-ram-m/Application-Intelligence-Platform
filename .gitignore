@@ -22,3 +22,6 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+
+# Personal working notes (learning/reference — not ready to be team-facing docs yet)
+docs/deployment-notes.md

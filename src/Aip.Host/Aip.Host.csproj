@@ -25,6 +25,7 @@
     <ProjectReference Include="../Aip.Plugins.Angular/Aip.Plugins.Angular.csproj" />
     <ProjectReference Include="../Aip.Plugins.React/Aip.Plugins.React.csproj" />
     <ProjectReference Include="../Aip.Plugins.NextJs/Aip.Plugins.NextJs.csproj" />
+    <ProjectReference Include="../Aip.Plugins.Security/Aip.Plugins.Security.csproj" />
     <!-- DependencyInjection/Logging/Configuration.* are now supplied transitively by the
          Microsoft.AspNetCore.App FrameworkReference above. -->
     <PackageReference Include="YamlDotNet" Version="18.1.0" />

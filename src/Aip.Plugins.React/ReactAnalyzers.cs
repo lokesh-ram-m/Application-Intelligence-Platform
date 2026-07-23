@@ -102,6 +102,26 @@ public sealed class ReactComponentAnalyzer : IAnalyzer
     private static readonly Regex ArrowConst = new(@"export\s+const\s+([A-Z]\w+)\s*(?::[^=]+)?=\s*(?:React\.)?(?:memo\(|forwardRef(?:<[^>]*>)?\()?\s*\(([^)]*)\)\s*(?::[^=]+)?=>", RegexOptions.Compiled);
     private static readonly Regex HookUse = new(@"\b(use[A-Z]\w*)\s*\(", RegexOptions.Compiled);
 
+    // A page's own <h1>/<h2> heading is the product-facing name a real user actually sees — often more
+    // meaningful than the component's technical file/export name (e.g. a screen named "ContractMasters" in
+    // code, but headed "Contract Masters" on screen — real, generic example this was written for, not a
+    // one-off). Deliberately narrow: only fires when a file has EXACTLY one h1/h2 (no ambiguity about which
+    // heading belongs to the default-exported component) and the heading is plain text, not a JS expression
+    // (`{title}`) — quoting an interpolated value as if it were a literal fact would be a real inaccuracy.
+    private static readonly Regex Heading = new(@"<h[12][^>]*>\s*([^<{}]{1,80}?)\s*</h[12]>", RegexOptions.Compiled);
+
+    // Detects a conditional keyed on emptiness (e.g. `{items.length === 0 ? <EmptyState/> : <Table/>}`) and
+    // captures what the empty branch actually shows. Deliberately narrow: only the `=== 0 ? <empty-branch`
+    // shape (the empty branch is the ternary's TRUE branch, immediately after `?`) — not the reversed
+    // `length > 0 ? <loaded> : <empty>` form. Correctly isolating content after a `:` inside arbitrary,
+    // possibly-nested JSX is a real balanced-parsing problem a regex can't safely solve, and guessing wrong
+    // would mislabel the loaded-state content as the empty state — worse than not capturing it at all.
+    // Only the first plain-text JSX content within a bounded window after the branch starts is captured —
+    // no deep traversal into nested logic, same discipline as the existing Wave C detectors.
+    private static readonly Regex EmptyStateBranch = new(@"\w+\.length\s*===\s*0\s*\?", RegexOptions.Compiled);
+    private static readonly Regex FirstJsxText = new(@">\s*([A-Za-z][^<>{}\r\n]{2,80}?)\s*<", RegexOptions.Compiled);
+    private const int EmptyStateWindow = 300;
+
     // React's own built-in hooks — excluded from the component→hook USES edge so it captures custom hooks
     // (the interesting, app-specific fact already grounded by ReactHookAnalyzer) rather than noise from
     // every component that merely calls useState/useEffect.
@@ -128,6 +148,19 @@ public sealed class ReactComponentAnalyzer : IAnalyzer
             List<string> customHooks = hookNames.Where(h => !BuiltinHooks.Contains(h)).ToList();
             string fileKind = FileKind(file.Path);
 
+            MatchCollection headings = Heading.Matches(file.Text);
+            string? displayName = headings.Count == 1 && headings[0].Groups[1].Value.Trim() is { Length: > 0 } h ? h : null;
+
+            MatchCollection emptyStateBranches = EmptyStateBranch.Matches(file.Text);
+            string? emptyStateLabel = null;
+            if (emptyStateBranches.Count == 1)
+            {
+                int start = emptyStateBranches[0].Index + emptyStateBranches[0].Length;
+                int windowLen = Math.Min(EmptyStateWindow, file.Text.Length - start);
+                if (windowLen > 0 && FirstJsxText.Match(file.Text, start, windowLen) is { Success: true } et)
+                    emptyStateLabel = et.Groups[1].Value.Trim();
+            }
+
             foreach ((Match m, bool isDefault) in DefaultFn.Matches(file.Text).Select(m => (m, true))
                          .Concat(NamedFn.Matches(file.Text).Select(m => (m, false)))
                          .Concat(ArrowConst.Matches(file.Text).Select(m => (m, false))))
@@ -143,6 +176,8 @@ public sealed class ReactComponentAnalyzer : IAnalyzer
                 string p = Rx.Props0(m.Groups[2].Value);
                 if (p.Length > 0) props.Add(("props", p));
                 if (hooks.Length > 0) props.Add(("hooks", hooks));
+                if (isDefault && displayName is not null) props.Add(("displayName", displayName));
+                if (isDefault && emptyStateLabel is not null) props.Add(("emptyStateLabel", emptyStateLabel));
 
                 Evidence ev = context.Evidence(file.Path, Rx.LineAt(file.Text, m.Index), name);
                 KnowledgeIdentity componentId = context.NodeId(Rx.Seg("component", name));
@@ -615,9 +650,21 @@ public sealed class ReactAnalyticsChartAnalyzer : IAnalyzer
 }
 
 /// <summary>
-/// Detects client-side filters via their <c>useState</c> declaration — any state variable whose name
-/// contains "filter" (e.g. <c>selectedStatusFilters</c>, <c>typeFilterOpen</c>) is grounded as a filter
-/// the UI exposes, named after the file it lives in.
+/// Detects client-side filters via their <c>useState</c> declaration and classifies WHAT they actually are,
+/// rather than only grounding that a filter-shaped variable exists — the earlier version treated every
+/// state variable whose name contained "filter" identically, which produced documentation that read like a
+/// raw variable dump instead of a description of what the screen lets a user do. Classification is purely
+/// structural (never a guess at business meaning):
+///  - a <c>...Open</c> suffix is UI chrome (a dropdown/panel's expanded state), not a filter criterion at
+///    all, and is dropped entirely — nobody documenting the system needs a dropdown's open/closed state.
+///  - a <c>selected...</c> prefix or plural <c>...Filters</c> suffix is a multi-select criterion.
+///  - a <c>...Tab</c> suffix is a tab-driven criterion.
+///  - everything else is a single-value criterion.
+/// It then traces actual USAGE in the same file — a <c>.filter(x => x.field === state)</c> predicate, a
+/// query-string/URLSearchParams builder, or an object-literal key the state is assigned to — to ground WHAT
+/// field or query parameter it filters against (<c>targetField</c>). When no usage site can be found the
+/// node is still emitted (the state genuinely exists), just without <c>targetField</c> — never guessed from
+/// the variable name alone.
 /// </summary>
 public sealed class ReactFilterAnalyzer : IAnalyzer
 {
@@ -640,19 +687,28 @@ public sealed class ReactFilterAnalyzer : IAnalyzer
         foreach (TsFile file in model.Files)
         {
             string component = Path.GetFileNameWithoutExtension(file.Path);
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+
             foreach (Match m in FilterState.Matches(file.Text).DistinctBy(m => m.Groups[1].Value))
             {
                 string field = m.Groups[1].Value;
+                seen.Add(field);
+                string? kind = ClassifyShape(field);
+                if (kind is null) continue; // "...Open" toggle-shaped UI chrome, not a filter criterion
+
+                var props = new List<(string, string)> { ("name", field), ("component", component), ("kind", kind) };
+                if (FindTargetField(file.Text, field) is { Length: > 0 } target) props.Add(("targetField", target));
+
                 Evidence ev = context.Evidence(file.Path, Rx.LineAt(file.Text, m.Index), field);
                 sink.Add(NodeDiscovery.Create(context.NodeId(Rx.Seg("filter", $"{component}:{field}")),
-                    NodeKind.From("Filter"), new[] { ev }, Confidence.From(0.75),
-                    Rx.Props(("name", field), ("component", component))));
+                    NodeKind.From("Filter"), new[] { ev }, Confidence.From(0.75), Rx.Props(props.ToArray())));
             }
 
             if (!FetchSignal.IsMatch(file.Text)) continue;
             foreach (Match m in TabState.Matches(file.Text).DistinctBy(m => m.Groups[1].Value))
             {
                 string field = m.Groups[1].Value;
+                if (!seen.Add(field)) continue; // already captured (and classified) via FilterState above
                 Evidence ev = context.Evidence(file.Path, Rx.LineAt(file.Text, m.Index), field);
                 sink.Add(NodeDiscovery.Create(context.NodeId(Rx.Seg("filter", $"{component}:{field}")),
                     NodeKind.From("Filter"), new[] { ev }, Confidence.From(0.6),
@@ -661,6 +717,44 @@ public sealed class ReactFilterAnalyzer : IAnalyzer
         }
 
         return Task.CompletedTask;
+    }
+
+    // Structural classification from the identifier's own naming convention — never a guess at business
+    // meaning, only at shape. Returns null for "...Open" toggle state, which isn't a filter criterion.
+    internal static string? ClassifyShape(string name)
+    {
+        if (name.EndsWith("Open", StringComparison.Ordinal)) return null;
+        if (name.StartsWith("selected", StringComparison.OrdinalIgnoreCase) || name.EndsWith("Filters", StringComparison.Ordinal)) return "multi-select";
+        if (name.EndsWith("Tab", StringComparison.Ordinal)) return "tab";
+        return "single-value";
+    }
+
+    // Traces the state variable to a usage site that reveals what it filters. Tried in order: a .filter()
+    // predicate comparing an object property (either comparison direction), a query-string interpolation,
+    // a URLSearchParams-style builder call, or an object-literal key it's assigned to. File-wide regex
+    // search rather than a scoped AST walk — same heuristic precision level as the rest of this analyzer —
+    // so on a file with multiple unrelated .filter() calls this can in principle attribute the wrong field;
+    // accepted as a disclosed limitation rather than building a full expression-tree walker for it.
+    internal static string? FindTargetField(string text, string name)
+    {
+        string n = Regex.Escape(name);
+
+        Match m = Regex.Match(text, @"\.filter\s*\(\s*\w+\s*=>[\s\S]{0,120}?\.(\w+)\s*(?:===?|!==?)\s*" + n + @"\b");
+        if (m.Success) return m.Groups[1].Value;
+
+        m = Regex.Match(text, @"\.filter\s*\(\s*\w+\s*=>[\s\S]{0,120}?" + n + @"\s*(?:===?|!==?)\s*\w+\.(\w+)\b");
+        if (m.Success) return m.Groups[1].Value;
+
+        m = Regex.Match(text, @"[?&]([\w-]+)=\$\{" + n + @"\}");
+        if (m.Success) return m.Groups[1].Value;
+
+        m = Regex.Match(text, @"\.(?:append|set)\s*\(\s*['""`]([\w-]+)['""`]\s*,\s*" + n + @"\b");
+        if (m.Success) return m.Groups[1].Value;
+
+        m = Regex.Match(text, @"(\w+)\s*:\s*" + n + @"\s*[,}]");
+        if (m.Success) return m.Groups[1].Value;
+
+        return null;
     }
 }
 
