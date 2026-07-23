@@ -24,11 +24,16 @@ internal sealed class AspNetCorePlugin : IPlugin
         new StatusWorkflowAnalyzer(),
         new BusinessRuleAnalyzer(),
         new DbContextAnalyzer(),
+        new MigrationAnalyzer(),
+        new DatabaseOperationAnalyzer(),
         new DependencyInjectionAnalyzer(),
         new DependencyAnalyzer(),
         new PackageAnalyzer(),
         new InfrastructureAnalyzer(),
+        new AuthorizationPolicyAnalyzer(),
+        new OutboundHttpAnalyzer(),
         new CqrsAnalyzer(),
+        new MediatorPublishAnalyzer(),
         new ValidatorAnalyzer(),
         new MessagingAnalyzer(),
         new DataAccessAnalyzer(),
@@ -37,6 +42,7 @@ internal sealed class AspNetCorePlugin : IPlugin
         new ProgramAnalyzer(),
         new MinimalApiAnalyzer(),
         new ConfigurationAnalyzer(),
+        new ConfigurationUsageAnalyzer(),
     };
 
     public PluginManifest Manifest { get; } = new(
@@ -49,7 +55,8 @@ internal sealed class AspNetCorePlugin : IPlugin
             "Controller", "Endpoint", "AzureFunction", "Service", "Repository", "Interface", "Entity", "AuditLog", "StatusWorkflow", "BusinessRule", "DataStore", "Configuration",
             "Project", "Technology", "Cache", "AuthScheme", "Cors", "HealthCheck", "Logging", "Messaging",
             "BackgroundJob", "Middleware", "Authorization", "Command", "Query", "Event", "Handler", "Validator",
-            "MessageBroker", "Consumer", "Message", "DataAccess", "Filter", "Resilience", "Component",
+            "MessageBroker", "Consumer", "Message", "DataAccess", "Filter", "Resilience", "Component", "DatabaseOperation", "Migration",
+            "AuthorizationPolicy", "OutboundCall",
         },
         Priority: 100,
         Dependencies: Array.Empty<string>());

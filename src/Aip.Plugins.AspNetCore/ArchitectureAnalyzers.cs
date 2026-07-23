@@ -24,6 +24,26 @@ internal sealed class InfrastructureAnalyzer : IAnalyzer
         foreach (SyntaxTree tree in model.Trees)
         {
             string path = model.PathOf(tree);
+            SemanticModel sm = model.GetSemanticModel(tree);
+
+            // A timer (System.Threading.Timer/PeriodicTimer, or the older System.Timers.Timer) is a
+            // scheduled/recurring background task with no framework registration call to scan for — the
+            // same "runs on its own, no Add*() to find" case IsHostedService already covers below, just
+            // via construction instead of inheritance. Semantic, so an unrelated app-defined "Timer" class
+            // doesn't get mistaken for the BCL one.
+            foreach (ObjectCreationExpressionSyntax creation in tree.GetRoot().DescendantNodes().OfType<ObjectCreationExpressionSyntax>())
+            {
+                ITypeSymbol? created = sm.GetTypeInfo(creation).Type;
+                if (created is not { Name: "Timer" or "PeriodicTimer" } || created.ContainingNamespace?.ToDisplayString() is not ("System.Threading" or "System.Timers")) continue;
+
+                Evidence tev = context.Evidence(path, Sym.Line(creation), created.Name);
+                string owner = creation.Ancestors().OfType<TypeDeclarationSyntax>().FirstOrDefault() is { } td
+                    && sm.GetDeclaredSymbol(td) is INamedTypeSymbol o ? o.Name : "(module)";
+                sink.Add(NodeDiscovery.Create(context.AppNodeId(Sym.Seg("backgroundjob", $"{owner}:{created.Name}:{Sym.Line(creation)}")),
+                    NodeKind.From("BackgroundJob"), new[] { tev }, Confidence.From(0.85),
+                    Sym.Props(("name", $"{owner} ({created.Name})"), ("detail", "timer"))));
+            }
+
             foreach (InvocationExpressionSyntax inv in tree.GetRoot().DescendantNodes().OfType<InvocationExpressionSyntax>())
             {
                 if (inv.Expression is not MemberAccessExpressionSyntax member) continue;
@@ -36,6 +56,7 @@ internal sealed class InfrastructureAnalyzer : IAnalyzer
                 if (fact.Value.Detail.Length > 0) props.Add(("detail", fact.Value.Detail));
                 if (fact.Value.Kind == "Middleware") props.Add(("order", Sym.Line(inv).ToString()));
                 if (StringArgOf(inv) is { Length: > 0 } arg) props.Add(("arg", arg));
+                if (call == "AddCors" && CorsOriginsOf(inv) is { Length: > 0 } origins) props.Add(("origins", origins));
 
                 sink.Add(NodeDiscovery.Create(
                     context.AppNodeId(Sym.Seg(fact.Value.Kind.ToLowerInvariant(), fact.Value.Name)),
@@ -127,6 +148,144 @@ internal sealed class InfrastructureAnalyzer : IAnalyzer
 
     private static string? StringArgOf(InvocationExpressionSyntax inv) =>
         (inv.ArgumentList.Arguments.FirstOrDefault()?.Expression as LiteralExpressionSyntax)?.Token.ValueText;
+
+    // AllowAnyOrigin()/WithOrigins(...) never sit directly in AddCors's own argument list — they're nested
+    // inside the policy-configuration lambda(s) it's given, commonly two levels deep (e.g. AddCors(options
+    // => options.AddPolicy("X", policy => policy.AllowAnyOrigin()))), and there may be several named
+    // policies. Scanning every descendant invocation is simpler than modeling that nesting and is agnostic
+    // to how many policies are configured. AllowAnyOrigin wins if both appear on different policies — the
+    // more security-relevant fact (this app permits *some* fully-open CORS policy) is worth surfacing over
+    // the fact that a stricter policy also exists.
+    private static string? CorsOriginsOf(InvocationExpressionSyntax addCorsCall)
+    {
+        var origins = new List<string>();
+        bool anyOrigin = false;
+        foreach (InvocationExpressionSyntax nested in addCorsCall.ArgumentList.DescendantNodes().OfType<InvocationExpressionSyntax>())
+        {
+            if (nested.Expression is not MemberAccessExpressionSyntax member) continue;
+            switch (member.Name.Identifier.Text)
+            {
+                case "AllowAnyOrigin": anyOrigin = true; break;
+                case "WithOrigins":
+                    foreach (ArgumentSyntax a in nested.ArgumentList.Arguments)
+                        if (a.Expression is LiteralExpressionSyntax { Token.ValueText: { Length: > 0 } lit })
+                            origins.Add(lit);
+                    break;
+            }
+        }
+
+        return anyOrigin ? "any" : origins.Count > 0 ? string.Join(", ", origins) : null;
+    }
+}
+
+/// <summary>
+/// Detects named authorization policy DEFINITIONS — <c>services.AddAuthorization(options =&gt;
+/// options.AddPolicy("Name", policy =&gt; policy.RequireRole(...)/.RequireClaim(...)/...))</c>, or the
+/// newer <c>AddAuthorizationBuilder().AddPolicy(...)</c> fluent form — as distinct from two facts already
+/// captured elsewhere: InfrastructureAnalyzer's coarse "AddAuthorization was called somewhere" presence
+/// flag, and ControllerAnalyzer's <c>[Authorize(Policy = "Name")]</c> USAGE-site capture (which only
+/// records that a policy NAME was referenced, never what it requires). This is the missing definition-site
+/// half — purely syntactic, matching the same style InfrastructureAnalyzer already uses for framework
+/// registration calls, since <c>AddPolicy</c> is distinctive enough that a name-shape match carries little
+/// false-positive risk.
+/// </summary>
+internal sealed class AuthorizationPolicyAnalyzer : IAnalyzer
+{
+    public string Name => "authorization-policies";
+
+    private static readonly HashSet<string> Requirements = new(StringComparer.Ordinal)
+        { "RequireRole", "RequireClaim", "RequireAssertion", "RequireAuthenticatedUser", "RequireUserName" };
+
+    public Task AnalyzeAsync(IAnalysisContext context, IDiscoverySink sink, CancellationToken ct = default)
+    {
+        var model = (RoslynSemanticModel)context.Model;
+
+        foreach (SyntaxTree tree in model.Trees)
+        {
+            SyntaxNode root = tree.GetRoot();
+            string path = model.PathOf(tree);
+
+            foreach (InvocationExpressionSyntax inv in root.DescendantNodes().OfType<InvocationExpressionSyntax>())
+            {
+                if (inv.Expression is not MemberAccessExpressionSyntax { Name.Identifier.Text: "AddPolicy" }) continue;
+                if (inv.ArgumentList.Arguments.Count < 2) continue;
+                if (inv.ArgumentList.Arguments[0].Expression is not LiteralExpressionSyntax { Token.Value: string policyName }) continue;
+
+                var requirements = new List<string>();
+                foreach (InvocationExpressionSyntax req in inv.ArgumentList.Arguments[1].Expression.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>())
+                {
+                    if (req.Expression is not MemberAccessExpressionSyntax { Name.Identifier.Text: var reqName } || !Requirements.Contains(reqName)) continue;
+                    var reqArgs = req.ArgumentList.Arguments.Select(a => a.Expression).OfType<LiteralExpressionSyntax>().Select(l => l.Token.ValueText).ToList();
+                    requirements.Add(reqArgs.Count > 0 ? $"{reqName}({string.Join(", ", reqArgs)})" : reqName);
+                }
+
+                Evidence ev = context.Evidence(path, Sym.Line(inv), policyName);
+                var props = new List<(string, string)> { ("name", policyName) };
+                if (requirements.Count > 0) props.Add(("requirements", string.Join("; ", requirements)));
+                sink.Add(NodeDiscovery.Create(context.AppNodeId(Sym.Seg("authpolicy", policyName)),
+                    NodeKind.From("AuthorizationPolicy"), new[] { ev }, Confidence.From(0.85), Sym.Props(props.ToArray())));
+            }
+        }
+
+        return Task.CompletedTask;
+    }
+}
+
+/// <summary>
+/// Detects backend-initiated OUTBOUND HTTP calls — HttpClient/IHttpClientFactory usage — the mirror image
+/// of the frontend HttpClient analyzers (which see calls made TO this backend) but for calls this backend
+/// makes to other services. Gated on the receiver's resolved TYPE being System.Net.Http.HttpClient
+/// specifically, not the method name alone — Get/Post/Send are common enough names elsewhere (Dapper,
+/// generic repositories, ...) that a syntax-only match would misfire.
+/// </summary>
+internal sealed class OutboundHttpAnalyzer : IAnalyzer
+{
+    public string Name => "outbound-http";
+
+    private static readonly Dictionary<string, string> Verbs = new(StringComparer.Ordinal)
+    {
+        ["GetAsync"] = "GET",
+        ["GetStringAsync"] = "GET",
+        ["GetByteArrayAsync"] = "GET",
+        ["GetStreamAsync"] = "GET",
+        ["PostAsync"] = "POST",
+        ["PutAsync"] = "PUT",
+        ["DeleteAsync"] = "DELETE",
+        ["PatchAsync"] = "PATCH",
+        ["SendAsync"] = "SEND",
+    };
+
+    public Task AnalyzeAsync(IAnalysisContext context, IDiscoverySink sink, CancellationToken ct = default)
+    {
+        var model = (RoslynSemanticModel)context.Model;
+
+        foreach (SyntaxTree tree in model.Trees)
+        {
+            SemanticModel sm = model.GetSemanticModel(tree);
+            string path = model.PathOf(tree);
+
+            foreach (InvocationExpressionSyntax inv in tree.GetRoot().DescendantNodes().OfType<InvocationExpressionSyntax>())
+            {
+                if (inv.Expression is not MemberAccessExpressionSyntax member) continue;
+                if (!Verbs.TryGetValue(member.Name.Identifier.Text, out string? verb)) continue;
+                if (sm.GetTypeInfo(member.Expression).Type is not { Name: "HttpClient" }) continue;
+
+                string? url = inv.ArgumentList.Arguments.Select(a => a.Expression)
+                    .Select(e => e is LiteralExpressionSyntax { Token.Value: string } or InterpolatedStringExpressionSyntax ? e.ToString() : null)
+                    .FirstOrDefault(s => s is not null);
+                string owner = inv.Ancestors().OfType<TypeDeclarationSyntax>().FirstOrDefault() is { } td
+                    && sm.GetDeclaredSymbol(td) is INamedTypeSymbol o ? o.Name : "(module)";
+
+                Evidence ev = context.Evidence(path, Sym.Line(inv), $"{owner}:{member.Name.Identifier.Text}");
+                var props = new List<(string, string)> { ("verb", verb), ("owner", owner) };
+                if (url is { Length: > 0 }) props.Add(("url", url));
+                sink.Add(NodeDiscovery.Create(context.AppNodeId(Sym.Seg("outboundcall", $"{owner}:{verb}:{Sym.Line(inv)}")),
+                    NodeKind.From("OutboundCall"), new[] { ev }, Confidence.From(0.85), Sym.Props(props.ToArray())));
+            }
+        }
+
+        return Task.CompletedTask;
+    }
 }
 
 /// <summary>
@@ -162,9 +321,16 @@ internal sealed class CqrsAnalyzer : IAnalyzer
                 sink.Add(NodeDiscovery.Create(Id(symbol), NodeKind.From(kind), new[] { ev }, Confidence.From(0.85), Sym.Props(props.ToArray())));
             }
 
-            // An event: INotification.
+            // An event: INotification. Domain vs Integration is a real distinction (fired for another part
+            // of THIS app to react to, vs meant to cross a service boundary) — classified the same way
+            // Command vs Query already is, namespace/folder text first then name suffix, defaulting to
+            // unclassified rather than guessing when neither signal is present.
             if (symbol.AllInterfaces.Any(i => i.Name == "INotification"))
-                sink.Add(NodeDiscovery.Create(Id(symbol), NodeKind.From("Event"), new[] { ev }, Confidence.From(0.85), Sym.Props(("name", symbol.Name))));
+            {
+                var eventProps = new List<(string, string)> { ("name", symbol.Name) };
+                if (ClassifyEventCategory(symbol) is { } category) eventProps.Add(("category", category));
+                sink.Add(NodeDiscovery.Create(Id(symbol), NodeKind.From("Event"), new[] { ev }, Confidence.From(0.85), Sym.Props(eventProps.ToArray())));
+            }
 
             // A handler: IRequestHandler<TReq,TRes> or INotificationHandler<T> — link handler → message.
             foreach (INamedTypeSymbol h in symbol.AllInterfaces.Where(i => i.Name is "IRequestHandler" or "INotificationHandler"))
@@ -189,6 +355,116 @@ internal sealed class CqrsAnalyzer : IAnalyzer
         // Structural fallback: no result (Unit/void) mutates → Command; returns data → Query.
 
         return result is null || result.Name == "Unit" ? "Command" : "Query";
+    }
+
+    // Unlike ClassifyCqrs, this has no structural fallback — an INotification with neither a namespace nor
+    // a name signal is left uncategorized rather than guessed at, since there's no equivalent to "does it
+    // return a result" to fall back on for Domain vs Integration.
+    private static string? ClassifyEventCategory(INamedTypeSymbol symbol)
+    {
+        string ns = symbol.ContainingNamespace?.ToDisplayString() ?? "";
+        if (ns.Contains("Integration", StringComparison.OrdinalIgnoreCase)) return "Integration";
+        if (ns.Contains("Domain", StringComparison.OrdinalIgnoreCase)) return "Domain";
+        if (symbol.Name.EndsWith("IntegrationEvent", StringComparison.Ordinal)) return "Integration";
+        if (symbol.Name.EndsWith("DomainEvent", StringComparison.Ordinal)) return "Domain";
+
+        return null;
+    }
+}
+
+/// <summary>
+/// The dispatch-site half of the CQRS flow — the half constructor-injection-based DEPENDS_ON tracking can
+/// never see, since <c>IMediator</c>/<c>ISender</c> are external interfaces, not in-source types, so no
+/// dependency edge ever connects a Controller/Endpoint to the specific Command/Query it invokes. Shared by
+/// <c>ControllerAnalyzer</c> and <c>MinimalApiAnalyzer</c>: scans a method or lambda body semantically for
+/// <c>mediator.Send(request)</c> / <c>sender.Send(request)</c> calls and resolves the concrete request type
+/// passed to each. Combined with <see cref="CqrsAnalyzer"/>'s existing HANDLES relationship
+/// (Handler → Command/Query) and the general dependency walker's DEPENDS_ON (Handler → Repository/DbContext),
+/// this closes the full Controller → Command → Handler → Repository chain without ever guessing at names —
+/// each hop is a real, independently-resolved semantic fact.
+/// </summary>
+internal static class MediatorDispatch
+{
+    public static IEnumerable<INamedTypeSymbol> FindDispatchedRequests(SyntaxNode? body, SemanticModel sm) =>
+        FindDispatched(body, sm, "Send", "IRequest");
+
+    // The publish-site half of the notification flow — the same dispatch-site gap as Send(), but for
+    // mediator.Publish(notification) instead. Notifications are commonly published from inside a Handler
+    // (a command handler that, once it's done, publishes a domain event) rather than from a Controller —
+    // so unlike Send() detection, this isn't scoped to endpoint dispatch sites; see MediatorPublishAnalyzer,
+    // which walks every in-source method body, not just controller actions/minimal-API lambdas.
+    public static IEnumerable<INamedTypeSymbol> FindPublishedNotifications(SyntaxNode? body, SemanticModel sm) =>
+        FindDispatched(body, sm, "Publish", "INotification");
+
+    private static IEnumerable<INamedTypeSymbol> FindDispatched(SyntaxNode? body, SemanticModel sm, string methodName, string messageInterface)
+    {
+        if (body is null) yield break;
+
+        foreach (InvocationExpressionSyntax inv in body.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>())
+        {
+            if (inv.Expression is not MemberAccessExpressionSyntax member) continue;
+            if (member.Name.Identifier.Text != methodName) continue;
+            if (inv.ArgumentList.Arguments.Count == 0) continue;
+
+            // Gate on the RECEIVER's own type, not the method name alone — "Send"/"Publish" are common names
+            // (HTTP clients, SignalR, channels, pub/sub SDKs) that have nothing to do with MediatR. Matched
+            // by interface name, not a hardcoded MediatR namespace, so this works whether the field is typed
+            // as the interface itself or a concrete Mediator-implementing class.
+            ITypeSymbol? receiver = sm.GetTypeInfo(member.Expression).Type;
+            bool isMediator = receiver is not null &&
+                (receiver.Name is "IMediator" or "ISender" or "IPublisher" || receiver.AllInterfaces.Any(i => i.Name is "IMediator" or "ISender" or "IPublisher"));
+            if (!isMediator) continue;
+
+            // The argument's static type, resolved regardless of whether it's `new FooEvent(...)` inline or
+            // a local variable — only counted when it's an in-source type that itself implements the
+            // expected message interface, so an unrelated same-named overload can't produce a false edge.
+            if (sm.GetTypeInfo(inv.ArgumentList.Arguments[0].Expression).Type is not INamedTypeSymbol message) continue;
+            if (!message.Locations.Any(l => l.IsInSource)) continue;
+            if (!message.AllInterfaces.Any(i => i.Name == messageInterface)) continue;
+
+            yield return message;
+        }
+    }
+}
+
+/// <summary>
+/// Finds every <c>mediator.Publish(notification)</c> call site across the whole repo — deliberately not
+/// scoped to Controller actions/minimal-API handlers like <see cref="MediatorDispatch"/>'s Send() detection,
+/// since a notification is just as commonly published from inside a Handler once it's finished its own
+/// work (a command handler that, having created an order, publishes an OrderCreatedEvent) as from an
+/// endpoint. Walks every in-source class's every method body and emits a DISPATCHES relationship from the
+/// containing class to the published notification.
+/// </summary>
+internal sealed class MediatorPublishAnalyzer : IAnalyzer
+{
+    public string Name => "mediator-publish";
+
+    public Task AnalyzeAsync(IAnalysisContext context, IDiscoverySink sink, CancellationToken ct = default)
+    {
+        var model = (RoslynSemanticModel)context.Model;
+        string project = context.Artifact.Name;
+
+        foreach ((TypeDeclarationSyntax decl, INamedTypeSymbol symbol, SemanticModel sm, string path) in Sym.Types(model))
+        {
+            if (symbol.TypeKind != TypeKind.Class) continue;
+            KnowledgeIdentity classId = context.NodeId(Sym.Seg("project", project), Sym.Seg("type", Sym.Name(symbol)));
+
+            foreach (BaseMethodDeclarationSyntax method in decl.Members.OfType<BaseMethodDeclarationSyntax>())
+            {
+                SyntaxNode? body = (SyntaxNode?)method.Body ?? method.ExpressionBody;
+                if (body is null) continue;
+
+                foreach (INamedTypeSymbol notification in MediatorDispatch.FindPublishedNotifications(body, sm))
+                {
+                    KnowledgeIdentity notificationId = context.NodeId(
+                        Sym.Seg("project", Sym.ProjectOf(notification) ?? project), Sym.Seg("type", Sym.Name(notification)));
+                    Evidence ev = context.Evidence(path, Sym.Line(method), symbol.Name);
+                    sink.Add(RelationshipDiscovery.Create(RelationshipType.From("DISPATCHES"), classId, notificationId, new[] { ev }, Confidence.From(0.85)));
+                }
+            }
+        }
+
+        return Task.CompletedTask;
     }
 }
 

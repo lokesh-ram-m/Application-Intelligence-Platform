@@ -10,6 +10,7 @@ using Aip.Plugins.Angular;
 using Aip.Plugins.AspNetCore;
 using Aip.Plugins.NextJs;
 using Aip.Plugins.React;
+using Aip.Plugins.Security;
 using Aip.Projections;
 using Aip.Query;
 using Aip.Registries;
@@ -75,6 +76,7 @@ public static class PlatformComposition
         services.AddAipAngularPlugin();
         services.AddAipReactPlugin();
         services.AddAipNextPlugin();
+        services.AddAipSecurityPlugin();
 
         return services;
     }

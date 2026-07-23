@@ -35,12 +35,24 @@ public sealed class FrontendAuthAnalyzer : IAnalyzer
 
     private static readonly Regex ImportFrom = new(@"from\s+[""']([^""']+)[""']", RegexOptions.Compiled);
 
+    // Operation (setItem/getItem) is now its own capture group, not folded into a non-capturing alternation
+    // — distinguishing reads from writes per key is what lets a downstream reader tell "this app manages
+    // its own token" apart from "this app only ever reads a token something else must have written" (see
+    // the aggregation in AnalyzeAsync below).
     private static readonly Regex LocalStorageToken =
-        new(@"localStorage\s*\.\s*(?:setItem|getItem)\s*\(\s*[`'""]([^`'""]*(?:token|jwt|auth)[^`'""]*)[`'""]", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        new(@"localStorage\s*\.\s*(setItem|getItem)\s*\(\s*[`'""]([^`'""]*(?:token|jwt|auth)[^`'""]*)[`'""]", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex SessionStorageToken =
-        new(@"sessionStorage\s*\.\s*(?:setItem|getItem)\s*\(\s*[`'""]([^`'""]*(?:token|jwt|auth)[^`'""]*)[`'""]", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        new(@"sessionStorage\s*\.\s*(setItem|getItem)\s*\(\s*[`'""]([^`'""]*(?:token|jwt|auth)[^`'""]*)[`'""]", RegexOptions.Compiled | RegexOptions.IgnoreCase);
     private static readonly Regex CookieToken =
         new(@"(?:document\.cookie\s*=|Cookies\s*\.\s*set|CookieService\b(?:[^;]*)\.\s*set)[^;\n]{0,80}(?:token|jwt|auth)", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    // Vite's `base` option, e.g. `defineConfig({ base: "/cms-ui/" })` — a genuine sub-path (not "/" or
+    // empty) means this app is built to be served from underneath some other path, not standalone at a
+    // domain root. That's the strongest syntactic signal available that an app is deployed as a
+    // micro-frontend rather than its own standalone site. Scoped to files that look like a Vite config by
+    // name, not matched anywhere in the codebase — a `base` key is a common enough object-literal property
+    // name elsewhere that matching it unscoped would produce real false positives.
+    private static readonly Regex ViteBasePath = new(@"base\s*:\s*[`'""]([^`'""]+)[`'""]", RegexOptions.Compiled);
 
     // Covers both the object-literal/colon form (`Authorization: \`Bearer ${t}\``) and the comma-separated
     // method-argument form Angular's HttpHeaders/HttpClient idiom uses (`.set('Authorization', 'Bearer ' + t)`,
@@ -56,8 +68,23 @@ public sealed class FrontendAuthAnalyzer : IAnalyzer
         var model = (TypeScriptSemanticModel)context.Model;
 
         var providers = new Dictionary<string, (string File, int Line)>();
-        var storageLocations = new Dictionary<string, (string File, int Line)>();
+        // Keyed by (location, key) rather than location alone — the whole point is telling apart two keys
+        // at the same storage location that behave differently (one round-tripped by this app, one only
+        // ever read). Ops accumulates every operation seen for that exact key across every file in this
+        // artifact, so a key set in one file and read in another is still correctly seen as read+write.
+        var storageKeys = new Dictionary<(string Location, string Key), (HashSet<string> Ops, string File, int Line)>();
         var attachPatterns = new Dictionary<string, (string File, int Line)>();
+        (string Value, string Path, int Line)? viteBasePath = null;
+
+        void RecordStorageMatch(string location, Match m, TsFile file)
+        {
+            string op = m.Groups[1].Value.Equals("setItem", StringComparison.OrdinalIgnoreCase) ? "set" : "get";
+            string key = m.Groups[2].Value;
+            var k = (location, key);
+            if (!storageKeys.TryGetValue(k, out (HashSet<string> Ops, string File, int Line) entry))
+                storageKeys[k] = entry = (new HashSet<string>(StringComparer.Ordinal), file.Path, LineAt(file.Text, m.Index));
+            entry.Ops.Add(op);
+        }
 
         foreach (TsFile file in model.Files)
         {
@@ -69,12 +96,10 @@ public sealed class FrontendAuthAnalyzer : IAnalyzer
                         providers[name] = (file.Path, LineAt(file.Text, m.Index));
             }
 
-            if (!storageLocations.ContainsKey("localStorage") && LocalStorageToken.Match(file.Text) is { Success: true } ls)
-                storageLocations["localStorage"] = (file.Path, LineAt(file.Text, ls.Index));
-            if (!storageLocations.ContainsKey("sessionStorage") && SessionStorageToken.Match(file.Text) is { Success: true } ss)
-                storageLocations["sessionStorage"] = (file.Path, LineAt(file.Text, ss.Index));
-            if (!storageLocations.ContainsKey("cookie") && CookieToken.Match(file.Text) is { Success: true } ck)
-                storageLocations["cookie"] = (file.Path, LineAt(file.Text, ck.Index));
+            foreach (Match m in LocalStorageToken.Matches(file.Text)) RecordStorageMatch("localStorage", m, file);
+            foreach (Match m in SessionStorageToken.Matches(file.Text)) RecordStorageMatch("sessionStorage", m, file);
+            if (CookieToken.Match(file.Text) is { Success: true } ck)
+                storageKeys.TryAdd(("cookie", "(unnamed)"), (new HashSet<string> { "set" }, file.Path, LineAt(file.Text, ck.Index)));
 
             if (!attachPatterns.ContainsKey("Authorization: Bearer header") && AuthHeaderAttach.Match(file.Text) is { Success: true } ah)
                 attachPatterns["Authorization: Bearer header"] = (file.Path, LineAt(file.Text, ah.Index));
@@ -82,6 +107,10 @@ public sealed class FrontendAuthAnalyzer : IAnalyzer
                 attachPatterns["Axios request interceptor"] = (file.Path, LineAt(file.Text, ax.Index));
             if (!attachPatterns.ContainsKey("Angular HttpInterceptor") && AngularInterceptorClass.Match(file.Text) is { Success: true } ng)
                 attachPatterns["Angular HttpInterceptor"] = (file.Path, LineAt(file.Text, ng.Index));
+
+            if (viteBasePath is null && Path.GetFileName(file.Path).StartsWith("vite.config", StringComparison.OrdinalIgnoreCase)
+                && ViteBasePath.Match(file.Text) is { Success: true } vb && vb.Groups[1].Value is not ("/" or ""))
+                viteBasePath = (vb.Groups[1].Value, file.Path, LineAt(file.Text, vb.Index));
         }
 
         foreach ((string name, (string path, int line)) in providers)
@@ -91,11 +120,12 @@ public sealed class FrontendAuthAnalyzer : IAnalyzer
                 new[] { ev }, Confidence.From(0.85), Props(("name", name))));
         }
 
-        foreach ((string location, (string path, int line)) in storageLocations)
+        foreach (((string location, string key), (HashSet<string> ops, string path, int line)) in storageKeys)
         {
-            Evidence ev = context.Evidence(path, line, location);
-            sink.Add(NodeDiscovery.Create(context.NodeId(Seg("tokenstorage", location)), NodeKind.From("TokenStorage"),
-                new[] { ev }, Confidence.From(0.75), Props(("location", location))));
+            Evidence ev = context.Evidence(path, line, key);
+            string operation = ops.Contains("set") && ops.Contains("get") ? "get+set" : ops.Contains("set") ? "set" : "get";
+            sink.Add(NodeDiscovery.Create(context.NodeId(Seg("tokenstorage", $"{location}:{key}")), NodeKind.From("TokenStorage"),
+                new[] { ev }, Confidence.From(0.75), Props(("location", location), ("key", key), ("operation", operation))));
         }
 
         foreach ((string pattern, (string path, int line)) in attachPatterns)
@@ -103,6 +133,13 @@ public sealed class FrontendAuthAnalyzer : IAnalyzer
             Evidence ev = context.Evidence(path, line, pattern);
             sink.Add(NodeDiscovery.Create(context.NodeId(Seg("tokenattachment", pattern)), NodeKind.From("TokenAttachment"),
                 new[] { ev }, Confidence.From(0.75), Props(("pattern", pattern))));
+        }
+
+        if (viteBasePath is { } vbp)
+        {
+            Evidence ev = context.Evidence(vbp.Path, vbp.Line, "base");
+            sink.Add(NodeDiscovery.Create(context.NodeId(Seg("configuration", "deployment-base-path")), NodeKind.From("Configuration"),
+                new[] { ev }, Confidence.From(0.85), Props(("name", "Frontend deployment base path"), ("value", vbp.Value))));
         }
 
         return Task.CompletedTask;

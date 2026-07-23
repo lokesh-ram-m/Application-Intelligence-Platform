@@ -23,6 +23,8 @@ internal sealed class AngularPlugin : IPlugin
         new AngularRouteAnalyzer(),
         new AngularDependencyAnalyzer(),
         new HttpClientAnalyzer(),
+        new AngularFormFieldAnalyzer(),
+        new AngularFilterAnalyzer(),
         new FrontendAuthAnalyzer(),
     };
 
@@ -31,7 +33,7 @@ internal sealed class AngularPlugin : IPlugin
         Version: "0.1.0",
         SupportedArtifacts: new[] { "angular-workspace" },
         Languages: new[] { "typescript" },
-        Capabilities: new[] { "UIComponent", "UIService", "Guard", "Interceptor", "Route", "ApiCall", "AuthProvider", "TokenStorage", "TokenAttachment" },
+        Capabilities: new[] { "UIComponent", "UIService", "Guard", "Interceptor", "Resolver", "Route", "ApiCall", "FormField", "Filter", "AuthProvider", "TokenStorage", "TokenAttachment", "Configuration" },
         Priority: 90,
         Dependencies: new[] { "aip.plugins.aspnetcore" });
 

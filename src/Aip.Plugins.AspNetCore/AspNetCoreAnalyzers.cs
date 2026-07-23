@@ -94,6 +94,37 @@ internal static class Sym
         t is INamedTypeSymbol { IsGenericType: true, TypeArguments.Length: 1 } nt
         && nt.Name is "List" or "IList" or "ICollection" or "IEnumerable" or "HashSet" or "Collection" or "IReadOnlyList" or "IReadOnlyCollection"
             ? nt.TypeArguments[0] : null;
+
+    // An action/handler's declared return type, exactly as Roslyn resolves it (Task<ActionResult<Order>>,
+    // IEnumerable<OrderDto>, ...) — recorded verbatim, never unwrapped/simplified into a guessed "real"
+    // success shape, since that would mean inferring ASP.NET Core's own status-code/negotiation behavior.
+    public static string ReturnTypeOf(IMethodSymbol m) => m.ReturnType.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat);
+
+    private static readonly (string Attr, string Source)[] BindingAttrs =
+    {
+        ("FromBody", "body"), ("FromQuery", "query"), ("FromRoute", "route"),
+        ("FromHeader", "header"), ("FromServices", "services"), ("FromForm", "form"),
+    };
+
+    // Each parameter's name, type, and binding source — but ONLY when an explicit [FromXxx] attribute
+    // states the source. When none is present, ASP.NET Core falls back to its own implicit-binding-source
+    // inference (simple type → route/query, complex type → body, differs between MVC and minimal APIs) —
+    // replicating that inference here risks confidently stating the wrong source, so an unattributed
+    // parameter is recorded with no source rather than a guessed one.
+    public static string? ParametersOf(IMethodSymbol m)
+    {
+        if (m.Parameters.Length == 0) return null;
+
+        return string.Join("; ", m.Parameters.Select(p =>
+        {
+            string type = p.Type.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat);
+            string? binding = BindingAttrs
+                .Where(b => p.GetAttributes().Any(a => (a.AttributeClass?.Name ?? "").Replace("Attribute", "") == b.Attr))
+                .Select(b => b.Source).FirstOrDefault();
+
+            return binding is null ? $"{p.Name}: {type}" : $"{p.Name}: {type} ({binding})";
+        }));
+    }
 }
 
 /// <summary>
@@ -149,9 +180,25 @@ internal sealed class ControllerAnalyzer : IAnalyzer
                 Evidence ev = context.Evidence(path, Sym.Line(method), method.Identifier.Text);
                 var eprops = new List<(string, string)> { ("verb", verb), ("route", route), ("action", method.Identifier.Text) };
                 if (epAuth is not null) eprops.Add(("authorize", epAuth));
+                if (sem.GetDeclaredSymbol(method) is IMethodSymbol actionSymbol)
+                {
+                    eprops.Add(("returns", Sym.ReturnTypeOf(actionSymbol)));
+                    if (Sym.ParametersOf(actionSymbol) is { } paramsStr) eprops.Add(("parameters", paramsStr));
+                }
                 sink.Add(NodeDiscovery.Create(endpointId, NodeKind.From("Endpoint"), new[] { ev }, Confidence.Full,
                     Sym.Props(eprops.ToArray())));
                 sink.Add(RelationshipDiscovery.Create(RelationshipType.From("EXPOSES"), controllerId, endpointId, new[] { ev }, Confidence.Full));
+
+                // The dispatch-site half of the CQRS flow (see MediatorDispatch) — links this exact action's
+                // Endpoint straight to whichever Command/Query it hands to IMediator/ISender, using the same
+                // endpointId already resolved above rather than re-deriving route/verb from scratch elsewhere.
+                SyntaxNode? actionBody = (SyntaxNode?)method.Body ?? method.ExpressionBody;
+                foreach (INamedTypeSymbol request in MediatorDispatch.FindDispatchedRequests(actionBody, sem))
+                {
+                    KnowledgeIdentity requestId = context.NodeId(
+                        Sym.Seg("project", Sym.ProjectOf(request) ?? project), Sym.Seg("type", Sym.Name(request)));
+                    sink.Add(RelationshipDiscovery.Create(RelationshipType.From("DISPATCHES"), endpointId, requestId, new[] { ev }, Confidence.From(0.85)));
+                }
             }
         }
 
@@ -704,8 +751,12 @@ internal sealed class DbContextAnalyzer : IAnalyzer
                 MethodDeclarationSyntax? onModelCreating = decl.Members.OfType<MethodDeclarationSyntax>()
                     .FirstOrDefault(m => m.Identifier.Text == "OnModelCreating");
                 if (onModelCreating is not null)
+                {
                     ExtractFluentRelationships(context, sink, sm, path, onModelCreating, project,
                         expr => EntityCallRoot(sm, expr));
+                    ExtractFluentEntityFacts(context, sink, sm, path, onModelCreating, project,
+                        expr => EntityCallRoot(sm, expr));
+                }
 
                 continue;
             }
@@ -719,8 +770,10 @@ internal sealed class DbContextAnalyzer : IAnalyzer
             string? builderParam = configure?.ParameterList.Parameters.FirstOrDefault()?.Identifier.Text;
             if (configure is null || builderParam is null) continue;
 
-            ExtractFluentRelationships(context, sink, sm, path, configure, project,
-                expr => expr is IdentifierNameSyntax id && id.Identifier.Text == builderParam ? configuredType : null);
+            Func<ExpressionSyntax, ITypeSymbol?> resolveConfiguredRoot = expr =>
+                expr is IdentifierNameSyntax id && id.Identifier.Text == builderParam ? configuredType : null;
+            ExtractFluentRelationships(context, sink, sm, path, configure, project, resolveConfiguredRoot);
+            ExtractFluentEntityFacts(context, sink, sm, path, configure, project, resolveConfiguredRoot);
         }
 
         return Task.CompletedTask;
@@ -735,6 +788,15 @@ internal sealed class DbContextAnalyzer : IAnalyzer
     // Walks every .HasOne(...)/.HasMany(...) call in the given method body, tracing each one's fluent chain
     // back to its entity root via resolveRoot, and resolving the related type either from an explicit
     // generic argument (HasOne<TRelated>()) or from the navigation-property lambda (HasOne(e => e.Author)).
+    //
+    // Cardinality: HasOne/HasMany alone only tell you HALF the relationship — the follow-up .WithOne(...)/
+    // .WithMany(...) chained AFTER it is what actually distinguishes one-to-one from many-to-one (or
+    // one-to-many from many-to-many). REFERENCES/HAS_MANY are kept as the emitted type for the two
+    // conventional/default cases (many-to-one, one-to-many) so existing rendering that already matches on
+    // those literal strings keeps working unchanged; the two less common, more decision-relevant shapes
+    // (one-to-one, many-to-many) get their own distinct relationship types instead of being silently folded
+    // into the generic ones. Relationship has no property bag, so cardinality can only ever live in the
+    // TYPE string itself, not as a property alongside REFERENCES/HAS_MANY.
     private static void ExtractFluentRelationships(
         IAnalysisContext context, IDiscoverySink sink, SemanticModel sm, string path,
         SyntaxNode scope, string project, Func<ExpressionSyntax, ITypeSymbol?> resolveRoot)
@@ -760,9 +822,78 @@ internal sealed class DbContextAnalyzer : IAnalyzer
             // via a DbSet<T> property or EntityAnalyzer — merged/deduped by identity in Validation either way.
             sink.Add(NodeDiscovery.Create(fromId, NodeKind.From("Entity"), new[] { ev }, Confidence.Full, Sym.Props(("name", fromType.Name))));
             sink.Add(NodeDiscovery.Create(toId, NodeKind.From("Entity"), new[] { ev }, Confidence.Full, Sym.Props(("name", toType.Name))));
-            string relType = callName == "HasOne" ? "REFERENCES" : "HAS_MANY";
+
+            string? followUp = ChainForward(inv).Select(f => (f.Expression as MemberAccessExpressionSyntax)?.Name.Identifier.Text)
+                .FirstOrDefault(n => n is "WithOne" or "WithMany");
+            string relType = (callName, followUp) switch
+            {
+                ("HasOne", "WithOne") => "HAS_ONE",
+                ("HasMany", "WithMany") => "MANY_TO_MANY",
+                ("HasOne", _) => "REFERENCES",
+                _ => "HAS_MANY",
+            };
             sink.Add(RelationshipDiscovery.Create(RelationshipType.From(relType), fromId, toId, new[] { ev }, Confidence.From(0.9)));
         }
+    }
+
+    // Walks FORWARD through a fluent chain from a HasOne/HasMany call (e.g. .WithOne(...)/.WithMany(...)/
+    // .HasForeignKey(...)) — the opposite direction from ChainRoot, which walks backward to find where the
+    // chain started.
+    private static IEnumerable<InvocationExpressionSyntax> ChainForward(InvocationExpressionSyntax start)
+    {
+        SyntaxNode? current = start;
+        while (current?.Parent is MemberAccessExpressionSyntax { Parent: InvocationExpressionSyntax next } access)
+        {
+            yield return next;
+            current = next;
+        }
+    }
+
+    // Entity-level facts beyond relationships — ToTable (table name), HasKey (primary key override), and
+    // HasIndex (indexed properties). Each is attached directly to the Entity node as a property, unlike
+    // relationship cardinality, since these genuinely belong to one entity rather than needing to live on
+    // a from/to edge.
+    private static void ExtractFluentEntityFacts(
+        IAnalysisContext context, IDiscoverySink sink, SemanticModel sm, string path,
+        SyntaxNode scope, string project, Func<ExpressionSyntax, ITypeSymbol?> resolveRoot)
+    {
+        foreach (InvocationExpressionSyntax inv in scope.DescendantNodes().OfType<InvocationExpressionSyntax>())
+        {
+            if (inv.Expression is not MemberAccessExpressionSyntax member) continue;
+            string callName = member.Name.Identifier.Text;
+            if (callName is not ("ToTable" or "HasKey" or "HasIndex")) continue;
+
+            ITypeSymbol? entityType = ChainRoot(member.Expression, resolveRoot);
+            if (entityType is null) continue;
+
+            string? value = callName switch
+            {
+                "ToTable" => FirstStringLiteralArg(inv),
+                _ => PropertyNamesOf(inv),
+            };
+            if (value is not { Length: > 0 }) continue;
+
+            KnowledgeIdentity entityId = Sym.TypeId(context, project, entityType);
+            Evidence ev = context.Evidence(path, Sym.Line(inv), $"{callName}({value})");
+            string propKey = callName switch { "ToTable" => "tableName", "HasKey" => "primaryKey", _ => "indexedProperties" };
+            sink.Add(NodeDiscovery.Create(entityId, NodeKind.From("Entity"), new[] { ev }, Confidence.Full,
+                Sym.Props(("name", entityType.Name), (propKey, value))));
+        }
+    }
+
+    // HasKey(e => e.Code)/HasIndex(e => e.Email) (single or e => new { e.A, e.B } composite) and the
+    // string-literal-property-name overload (HasKey("Code")) both resolve to a comma-joined property list.
+    private static string? PropertyNamesOf(InvocationExpressionSyntax inv)
+    {
+        ExpressionSyntax? arg = inv.ArgumentList.Arguments.FirstOrDefault()?.Expression;
+        return arg switch
+        {
+            SimpleLambdaExpressionSyntax { Body: MemberAccessExpressionSyntax { Name.Identifier.Text: var prop } } => prop,
+            SimpleLambdaExpressionSyntax { Body: AnonymousObjectCreationExpressionSyntax anon } =>
+                string.Join(", ", anon.Initializers.Select(i => i.Expression).OfType<MemberAccessExpressionSyntax>().Select(m => m.Name.Identifier.Text)),
+            LiteralExpressionSyntax { Token.Value: string s } => s,
+            _ => null,
+        };
     }
 
     // Walks a fluent chain leftward (through .WithOne(...), .HasForeignKey(...), …) until resolveRoot
@@ -789,9 +920,376 @@ internal sealed class DbContextAnalyzer : IAnalyzer
 
         return prop is null ? null : Sym.ElementOfCollection(prop.Type) ?? prop.Type;
     }
+
+    private static string? FirstStringLiteralArg(InvocationExpressionSyntax inv) =>
+        inv.ArgumentList.Arguments.Select(a => a.Expression).OfType<LiteralExpressionSyntax>()
+            .Select(l => l.Token.Value as string).FirstOrDefault(s => s is not null);
 }
 
-/// <summary>Detects DI registrations, resolving interface/implementation type arguments semantically.</summary>
+/// <summary>
+/// Detects EF Core migrations — classes inheriting <c>Migration</c> with an <c>Up()</c> override — and
+/// summarizes what each one actually does, read from the literal table/column names its own
+/// <c>migrationBuilder.CreateTable/DropTable/AddColumn/...</c> calls pass, not inferred from the migration
+/// class's own name (which is usually a good guess but not guaranteed — a renamed migration file whose
+/// class name wasn't updated to match would otherwise mislead a reader).
+/// </summary>
+internal sealed class MigrationAnalyzer : IAnalyzer
+{
+    public string Name => "migrations";
+
+    private static readonly HashSet<string> Operations = new(StringComparer.Ordinal)
+    {
+        "CreateTable", "DropTable", "RenameTable", "AddColumn", "DropColumn", "RenameColumn", "AlterColumn",
+        "AddForeignKey", "DropForeignKey", "CreateIndex", "DropIndex", "AddPrimaryKey", "DropPrimaryKey",
+    };
+
+    public Task AnalyzeAsync(IAnalysisContext context, IDiscoverySink sink, CancellationToken ct = default)
+    {
+        var model = (RoslynSemanticModel)context.Model;
+        string project = context.Artifact.Name;
+
+        foreach ((TypeDeclarationSyntax decl, INamedTypeSymbol symbol, _, string path) in Sym.Types(model))
+        {
+            if (symbol.TypeKind != TypeKind.Class || !Sym.InheritsFrom(symbol, decl, "Migration")) continue;
+
+            MethodDeclarationSyntax? up = decl.Members.OfType<MethodDeclarationSyntax>().FirstOrDefault(m => m.Identifier.Text == "Up");
+            var ops = new List<string>();
+            if (up?.Body is not null)
+            {
+                foreach (InvocationExpressionSyntax inv in up.Body.DescendantNodes().OfType<InvocationExpressionSyntax>())
+                {
+                    if (inv.Expression is not MemberAccessExpressionSyntax member || !Operations.Contains(member.Name.Identifier.Text)) continue;
+                    string? target = NamedOrFirstStringArg(inv);
+                    ops.Add(target is { Length: > 0 } ? $"{member.Name.Identifier.Text}({target})" : member.Name.Identifier.Text);
+                }
+            }
+
+            Evidence ev = context.Evidence(path, Sym.Line(decl), symbol.Name);
+            var props = new List<(string, string)> { ("name", symbol.Name) };
+            if (ops.Count > 0) props.Add(("operations", string.Join("; ", ops.Take(20))));
+            sink.Add(NodeDiscovery.Create(context.NodeId(Sym.Seg("project", project), Sym.Seg("migration", symbol.Name)),
+                NodeKind.From("Migration"), new[] { ev }, Confidence.Full, Sym.Props(props.ToArray())));
+        }
+
+        return Task.CompletedTask;
+    }
+
+    // migrationBuilder.CreateTable(name: "Orders", ...) uses a named "name:" argument; falls back to the
+    // first positional string literal for the handful of calls that don't (e.g. AlterColumn's shape).
+    private static string? NamedOrFirstStringArg(InvocationExpressionSyntax inv)
+    {
+        ArgumentSyntax? named = inv.ArgumentList.Arguments.FirstOrDefault(a => a.NameColon?.Name.Identifier.Text == "name");
+        if (named?.Expression is LiteralExpressionSyntax { Token.Value: string namedVal }) return namedVal;
+
+        return inv.ArgumentList.Arguments.Select(a => a.Expression).OfType<LiteralExpressionSyntax>()
+            .Select(l => l.Token.Value as string).FirstOrDefault(s => s is not null);
+    }
+}
+
+/// <summary>
+/// Builds a per-call-site Database Interaction Model — the piece <see cref="TechnologyUsageAnalyzer"/>'s
+/// flat, per-class method-name bag never captured: for every EF Core/Dapper/raw-SQL call site anywhere in
+/// the repo, WHICH entity it touches, WHAT kind of operation it performs (Read/Insert/Update/Delete/
+/// Persist/Aggregate/Transaction/RawSql/StoredProcedure), the LINQ operator chain that shaped the query
+/// (Where/Include/OrderBy/...), whether it opted out of change tracking, sync vs async, and — for raw
+/// SQL/Dapper — the literal SQL text when the query is a compile-time-known string. Each call site is its
+/// own node (not aggregated), carrying the owning class and method as properties, so it can later be walked
+/// from the specific execution path that reaches it (see Documentation.cs's request-flow rendering).
+///
+/// Precision is the whole design constraint here: a false "this is a database call" is worse than a missed
+/// one, so every branch requires a real semantic signal, never a name-shape guess alone —
+/// <list type="bullet">
+/// <item>EF Core LINQ chains only count when the chain's root expression resolves to an actual
+/// <c>DbSet&lt;T&gt;</c> (checked by type, not by variable name) — this is what stops an ordinary
+/// <c>List&lt;Order&gt;.Add(...)</c> or <c>IEnumerable&lt;T&gt;.Where(...)</c> from being mistaken for a
+/// database write just because it shares a method name with EF Core.</item>
+/// <item>Dapper calls only count when the invoked method's own symbol resolves into an assembly named
+/// Dapper — <c>Query</c>/<c>Execute</c> are common enough names that matching on text alone would be a real
+/// false-positive risk.</item>
+/// <item>SaveChanges/transaction calls (which have no entity to anchor on) require the receiver's type name
+/// to actually look like a data-access type (DbContext/Database/Connection/Transaction) rather than trusting
+/// the method name in isolation.</item>
+/// </list>
+/// </summary>
+internal sealed class DatabaseOperationAnalyzer : IAnalyzer
+{
+    public string Name => "database-operations";
+
+    // Method name -> the operation it performs. Deliberately narrow to method names with essentially no
+    // other plausible meaning in a data-access context — see the class-level precision constraints above
+    // for how each branch additionally confirms it's really talking to a database before trusting this.
+    private static readonly Dictionary<string, string> OperationKinds = new(StringComparer.Ordinal)
+    {
+        ["Find"] = "Read",
+        ["FindAsync"] = "Read",
+        ["First"] = "Read",
+        ["FirstAsync"] = "Read",
+        ["FirstOrDefault"] = "Read",
+        ["FirstOrDefaultAsync"] = "Read",
+        ["Single"] = "Read",
+        ["SingleAsync"] = "Read",
+        ["SingleOrDefault"] = "Read",
+        ["SingleOrDefaultAsync"] = "Read",
+        ["ToList"] = "Read",
+        ["ToListAsync"] = "Read",
+        ["ToArray"] = "Read",
+        ["ToArrayAsync"] = "Read",
+        ["ToDictionary"] = "Read",
+        ["ToDictionaryAsync"] = "Read",
+        ["ToHashSet"] = "Read",
+        ["ToHashSetAsync"] = "Read",
+        ["Any"] = "Read",
+        ["AnyAsync"] = "Read",
+        ["Load"] = "Read",
+        ["LoadAsync"] = "Read",
+        ["AsEnumerable"] = "Read",
+        ["AsAsyncEnumerable"] = "Read",
+
+        ["Add"] = "Insert",
+        ["AddAsync"] = "Insert",
+        ["AddRange"] = "Insert",
+        ["AddRangeAsync"] = "Insert",
+
+        ["Update"] = "Update",
+        ["UpdateRange"] = "Update",
+        ["ExecuteUpdate"] = "Update",
+        ["ExecuteUpdateAsync"] = "Update",
+
+        ["Remove"] = "Delete",
+        ["RemoveRange"] = "Delete",
+        ["ExecuteDelete"] = "Delete",
+        ["ExecuteDeleteAsync"] = "Delete",
+
+        ["SaveChanges"] = "Persist",
+        ["SaveChangesAsync"] = "Persist",
+
+        ["Count"] = "Aggregate",
+        ["CountAsync"] = "Aggregate",
+        ["LongCount"] = "Aggregate",
+        ["LongCountAsync"] = "Aggregate",
+        ["Sum"] = "Aggregate",
+        ["SumAsync"] = "Aggregate",
+        ["Average"] = "Aggregate",
+        ["AverageAsync"] = "Aggregate",
+        ["Min"] = "Aggregate",
+        ["MinAsync"] = "Aggregate",
+        ["Max"] = "Aggregate",
+        ["MaxAsync"] = "Aggregate",
+
+        ["BeginTransaction"] = "Transaction",
+        ["BeginTransactionAsync"] = "Transaction",
+        ["Commit"] = "Transaction",
+        ["CommitAsync"] = "Transaction",
+        ["CommitTransaction"] = "Transaction",
+        ["CommitTransactionAsync"] = "Transaction",
+        ["Rollback"] = "Transaction",
+        ["RollbackAsync"] = "Transaction",
+        ["RollbackTransaction"] = "Transaction",
+        ["RollbackTransactionAsync"] = "Transaction",
+    };
+
+    // Kinds with no entity to anchor on — EntityOf will never resolve one, so these are gated on the
+    // receiver's type name instead (see LooksLikeDbReceiver).
+    private static readonly HashSet<string> EntitylessKinds = new(StringComparer.Ordinal) { "Persist", "Transaction" };
+
+    private static readonly HashSet<string> LinqOperators = new(StringComparer.Ordinal)
+    {
+        "Where", "Select", "SelectMany", "Join", "GroupJoin", "Include", "ThenInclude", "GroupBy",
+        "OrderBy", "OrderByDescending", "ThenBy", "ThenByDescending", "Skip", "Take", "Distinct",
+        "AsNoTracking", "AsTracking", "AsSplitQuery", "Union", "Concat", "Except", "Intersect",
+    };
+
+    private static readonly HashSet<string> DapperMethods = new(StringComparer.Ordinal)
+    {
+        "Query", "QueryAsync", "QueryFirst", "QueryFirstAsync", "QueryFirstOrDefault", "QueryFirstOrDefaultAsync",
+        "QuerySingle", "QuerySingleAsync", "QuerySingleOrDefault", "QuerySingleOrDefaultAsync",
+        "Execute", "ExecuteAsync", "ExecuteScalar", "ExecuteScalarAsync", "ExecuteReader", "ExecuteReaderAsync",
+    };
+
+    private static readonly HashSet<string> RawSqlMethods = new(StringComparer.Ordinal)
+    {
+        "FromSqlRaw", "FromSqlInterpolated", "ExecuteSqlRaw", "ExecuteSqlRawAsync",
+        "ExecuteSqlInterpolated", "ExecuteSqlInterpolatedAsync",
+    };
+
+    public Task AnalyzeAsync(IAnalysisContext context, IDiscoverySink sink, CancellationToken ct = default)
+    {
+        var model = (RoslynSemanticModel)context.Model;
+        string project = context.Artifact.Name;
+
+        foreach ((TypeDeclarationSyntax decl, INamedTypeSymbol symbol, SemanticModel sm, string path) in Sym.Types(model))
+        {
+            if (symbol.TypeKind != TypeKind.Class) continue;
+
+            foreach (BaseMethodDeclarationSyntax method in decl.Members.OfType<BaseMethodDeclarationSyntax>())
+            {
+                SyntaxNode? body = (SyntaxNode?)method.Body ?? method.ExpressionBody;
+                if (body is null) continue;
+                string methodName = MethodLabel(method);
+                int seq = 0;
+
+                foreach (InvocationExpressionSyntax inv in body.DescendantNodes().OfType<InvocationExpressionSyntax>())
+                {
+                    if (inv.Expression is not MemberAccessExpressionSyntax member) continue;
+                    string call = member.Name.Identifier.Text;
+
+                    if (DapperMethods.Contains(call) && IsDapperCall(inv, sm))
+                    {
+                        ITypeSymbol? entity = DapperEntityOf(member, sm);
+                        string? sql = FirstSqlTextArg(inv);
+                        string kind = LooksLikeStoredProcedureCall(sql) || HasStoredProcedureCommandType(inv, sm)
+                            ? "StoredProcedure" : call.StartsWith("Query", StringComparison.Ordinal) ? "Read" : "Write";
+                        Emit(context, sink, path, inv, project, symbol.Name, methodName, ref seq,
+                            entity, kind, call, "Dapper", Array.Empty<string>(), false,
+                            call.EndsWith("Async", StringComparison.Ordinal), sql);
+                        continue;
+                    }
+
+                    if (RawSqlMethods.Contains(call))
+                    {
+                        (List<string> ops, ExpressionSyntax root) = WalkChain(inv, sm);
+                        string? sql = FirstSqlTextArg(inv);
+                        string kind = LooksLikeStoredProcedureCall(sql) ? "StoredProcedure" : "RawSql";
+                        Emit(context, sink, path, inv, project, symbol.Name, methodName, ref seq,
+                            EntityOf(root, sm), kind, call, "EF Core", ops, ops.Contains("AsNoTracking"),
+                            call.EndsWith("Async", StringComparison.Ordinal), sql);
+                        continue;
+                    }
+
+                    if (!OperationKinds.TryGetValue(call, out string? opKind)) continue;
+
+                    if (EntitylessKinds.Contains(opKind))
+                    {
+                        if (!LooksLikeDbReceiver(sm.GetTypeInfo(member.Expression).Type)) continue;
+                        Emit(context, sink, path, inv, project, symbol.Name, methodName, ref seq,
+                            null, opKind, call, "EF Core", Array.Empty<string>(), false,
+                            call.EndsWith("Async", StringComparison.Ordinal), null);
+                        continue;
+                    }
+
+                    (List<string> operators, ExpressionSyntax chainRoot) = WalkChain(inv, sm);
+                    ITypeSymbol? entityType = EntityOf(chainRoot, sm);
+                    if (entityType is null) continue;   // chain doesn't root at a real DbSet<T> — not a DB call
+                    Emit(context, sink, path, inv, project, symbol.Name, methodName, ref seq,
+                        entityType, opKind, call, "EF Core", operators, operators.Contains("AsNoTracking"),
+                        call.EndsWith("Async", StringComparison.Ordinal), null);
+                }
+            }
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private static string MethodLabel(BaseMethodDeclarationSyntax method) => method switch
+    {
+        MethodDeclarationSyntax m => m.Identifier.Text,
+        ConstructorDeclarationSyntax c => c.Identifier.Text,
+        _ => method.Kind().ToString(),
+    };
+
+    // Walks a fluent invocation chain leftward from the call just before the terminal one, collecting each
+    // intermediate step's method name (LINQ operators, AsNoTracking, ...), stopping the moment it reaches an
+    // expression that is ITSELF DbSet&lt;T&gt;-typed — the real querying source — whether that's a plain
+    // property/field access (_context.Orders) or a Set&lt;TEntity&gt;() call (also an invocation, so without
+    // this type-based stop condition it would otherwise get walked straight past as just another operator).
+    private static (List<string> Operators, ExpressionSyntax Root) WalkChain(InvocationExpressionSyntax terminal, SemanticModel sm)
+    {
+        var operators = new List<string>();
+        if (terminal.Expression is not MemberAccessExpressionSyntax terminalMember) return (operators, terminal);
+
+        ExpressionSyntax current = terminalMember.Expression;
+        while (true)
+        {
+            if (sm.GetTypeInfo(current).Type is INamedTypeSymbol { Name: "DbSet" }) break;
+            if (current is InvocationExpressionSyntax inv && inv.Expression is MemberAccessExpressionSyntax member)
+            {
+                operators.Insert(0, member.Name.Identifier.Text);
+                current = member.Expression;
+                continue;
+            }
+
+            break;
+        }
+
+        return (operators, current);
+    }
+
+    // The entity a chain operates on — resolvable only when the root itself is genuinely DbSet<T>-typed
+    // (by TYPE, not by the variable/property being named something plausible), which is what keeps an
+    // ordinary in-memory List<Order>/IEnumerable<Order> from being mistaken for a database query just
+    // because it also carries a generic type argument.
+    private static ITypeSymbol? EntityOf(ExpressionSyntax root, SemanticModel sm) =>
+        sm.GetTypeInfo(root).Type is INamedTypeSymbol { Name: "DbSet", TypeArguments.Length: 1 } dbSet
+            ? dbSet.TypeArguments[0] : null;
+
+    // Dapper has no DbSet-shaped root to anchor on — its entity comes from the call's own generic type
+    // argument (connection.Query<Order>(...)), when the call was written with one at all.
+    private static ITypeSymbol? DapperEntityOf(MemberAccessExpressionSyntax member, SemanticModel sm) =>
+        member.Name is GenericNameSyntax { TypeArgumentList.Arguments: [var typeArg, ..] }
+            ? sm.GetSymbolInfo(typeArg).Symbol as ITypeSymbol : null;
+
+    private static bool IsDapperCall(InvocationExpressionSyntax inv, SemanticModel sm) =>
+        (sm.GetSymbolInfo(inv).Symbol?.ContainingAssembly?.Name ?? "").Contains("Dapper", StringComparison.OrdinalIgnoreCase);
+
+    private static bool LooksLikeDbReceiver(ITypeSymbol? receiver) =>
+        receiver is not null && (receiver.Name.Contains("DbContext", StringComparison.Ordinal)
+            || receiver.Name.Contains("Database", StringComparison.Ordinal)
+            || receiver.Name.Contains("Connection", StringComparison.Ordinal)
+            || receiver.Name.Contains("Transaction", StringComparison.Ordinal));
+
+    // Only ever captured when the SQL is a compile-time-known string shape — a literal or an interpolated
+    // string exactly as written (placeholders and all) — never the runtime-resolved value, which static
+    // analysis can't know and shouldn't pretend to.
+    private static string? FirstSqlTextArg(InvocationExpressionSyntax inv) =>
+        inv.ArgumentList.Arguments.Select(a => a.Expression)
+            .Select(e => e is LiteralExpressionSyntax { Token.Value: string } or InterpolatedStringExpressionSyntax ? e.ToString() : null)
+            .FirstOrDefault(s => s is not null);
+
+    private static bool LooksLikeStoredProcedureCall(string? sql)
+    {
+        if (sql is null) return false;
+        string trimmed = sql.TrimStart('$', '"', ' ');
+        return trimmed.StartsWith("EXEC", StringComparison.OrdinalIgnoreCase) || trimmed.StartsWith("CALL", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool HasStoredProcedureCommandType(InvocationExpressionSyntax inv, SemanticModel sm) =>
+        inv.ArgumentList.Arguments.Any(a => a.Expression is MemberAccessExpressionSyntax { Name.Identifier.Text: "StoredProcedure" } access
+            && sm.GetSymbolInfo(access.Expression).Symbol?.ToDisplayString() is "System.Data.CommandType" or "System.Data.CommandType?");
+
+    private static void Emit(IAnalysisContext context, IDiscoverySink sink, string path, InvocationExpressionSyntax inv,
+        string project, string owner, string method, ref int seq,
+        ITypeSymbol? entity, string operation, string call, string approach, IReadOnlyList<string> operators, bool noTracking, bool isAsync, string? sql)
+    {
+        seq++;
+        string entityName = entity is not null ? Sym.Name(entity).Split('.').Last() : "";
+        Evidence ev = context.Evidence(path, Sym.Line(inv), $"{owner}.{method}:{call}");
+        var props = new List<(string, string)>
+        {
+            ("operation", operation), ("method", call), ("approach", approach), ("owner", owner), ("callerMethod", method),
+        };
+        if (entityName.Length > 0) props.Add(("entity", entityName));
+        if (operators.Count > 0) props.Add(("operators", string.Join(", ", operators.Where(o => LinqOperators.Contains(o) || o == "AsNoTracking"))));
+        if (noTracking) props.Add(("tracking", "no-tracking"));
+        if (isAsync) props.Add(("async", "true"));
+        if (sql is { Length: > 0 }) props.Add(("sql", sql));
+
+        sink.Add(NodeDiscovery.Create(
+            context.AppNodeId(Sym.Seg("dboperation", $"{project}:{owner}:{method}:{call}:{seq}")),
+            NodeKind.From("DatabaseOperation"), new[] { ev }, Confidence.From(0.85), Sym.Props(props.ToArray())));
+    }
+}
+
+/// <summary>
+/// Detects DI registrations, resolving interface/implementation type arguments semantically. Covers three
+/// distinct call shapes ASP.NET Core's DI container accepts: the ordinary <c>AddScoped&lt;IFoo, Foo&gt;()</c>
+/// generic-method form, a factory registration (<c>AddScoped&lt;IFoo&gt;(sp =&gt; new Foo(...))</c>, single
+/// type argument, implementation resolved from what the factory lambda actually returns), and an open-
+/// generic registration (<c>AddScoped(typeof(IRepository&lt;&gt;), typeof(Repository&lt;&gt;))</c>, a
+/// non-generic method call with two <c>typeof()</c> arguments — a different syntactic shape entirely, not a
+/// variant of the generic-method case). The specific lifetime word (Scoped/Singleton/Transient) is kept as a
+/// property on the implementation node — <see cref="Relationship"/> has no property bag, so it can't live on
+/// the IMPLEMENTS edge itself.
+/// </summary>
 internal sealed class DependencyInjectionAnalyzer : IAnalyzer
 {
     private static readonly string[] Methods = { "AddScoped", "AddSingleton", "AddTransient" };
@@ -809,27 +1307,80 @@ internal sealed class DependencyInjectionAnalyzer : IAnalyzer
             string path = model.PathOf(tree);
             foreach (InvocationExpressionSyntax inv in tree.GetRoot().DescendantNodes().OfType<InvocationExpressionSyntax>())
             {
-                if (inv.Expression is not MemberAccessExpressionSyntax { Name: GenericNameSyntax g }) continue;
-                if (!Methods.Contains(g.Identifier.Text) || g.TypeArgumentList.Arguments.Count != 2) continue;
+                // Shape 1 & 2: services.AddScoped<IFoo, Foo>() or services.AddScoped<IFoo>(sp => new Foo()).
+                if (inv.Expression is MemberAccessExpressionSyntax { Name: GenericNameSyntax g } && Methods.Contains(g.Identifier.Text))
+                {
+                    string lifetime = g.Identifier.Text["Add".Length..];
 
-                (string iface, string ifaceProj) = Resolve(sm, g.TypeArgumentList.Arguments[0], project);
-                (string impl, string implProj) = Resolve(sm, g.TypeArgumentList.Arguments[1], project);
-                KnowledgeIdentity implId = context.NodeId(Sym.Seg("project", implProj), Sym.Seg("type", impl));
-                KnowledgeIdentity ifaceId = context.NodeId(Sym.Seg("project", ifaceProj), Sym.Seg("type", iface));
-                Evidence ev = context.Evidence(path, Sym.Line(inv), $"{g.Identifier.Text}<{iface},{impl}>");
-                string implKind = impl.EndsWith("Repository", StringComparison.Ordinal) ? "Repository" : "Service";
-                sink.Add(NodeDiscovery.Create(implId, NodeKind.From(implKind), new[] { ev }, Confidence.Full, Sym.Props(("name", impl.Split('.').Last()))));
-                sink.Add(RelationshipDiscovery.Create(RelationshipType.From("IMPLEMENTS"), implId, ifaceId, new[] { ev }, Confidence.Full));
+                    if (g.TypeArgumentList.Arguments.Count == 2)
+                    {
+                        (string iface, string ifaceProj) = Resolve(sm, g.TypeArgumentList.Arguments[0], project);
+                        (string impl, string implProj) = Resolve(sm, g.TypeArgumentList.Arguments[1], project);
+                        Emit(context, sink, path, Sym.Line(inv), $"{g.Identifier.Text}<{iface},{impl}>", iface, ifaceProj, impl, implProj, lifetime);
+                        continue;
+                    }
+
+                    if (g.TypeArgumentList.Arguments.Count == 1
+                        && inv.ArgumentList.Arguments.Select(a => a.Expression).OfType<AnonymousFunctionExpressionSyntax>().FirstOrDefault() is { } factory
+                        && FactoryReturnType(factory, sm) is { } implType && implType.Locations.Any(l => l.IsInSource))
+                    {
+                        (string iface, string ifaceProj) = Resolve(sm, g.TypeArgumentList.Arguments[0], project);
+                        string impl = Sym.Name(implType);
+                        Emit(context, sink, path, Sym.Line(inv), $"{g.Identifier.Text}<{iface}>(factory)", iface, ifaceProj, impl, Sym.ProjectOf(implType) ?? project, lifetime);
+                    }
+
+                    continue;
+                }
+
+                // Shape 3: services.AddScoped(typeof(IRepository<>), typeof(Repository<>)) — open generics.
+                // Not a GenericNameSyntax call at all (the method name itself carries no type arguments), so
+                // it needs its own detection rather than falling out of the generic-method branch above.
+                if (inv.Expression is MemberAccessExpressionSyntax { Name: IdentifierNameSyntax openName }
+                    && Methods.Contains(openName.Identifier.Text)
+                    && inv.ArgumentList.Arguments is [{ Expression: TypeOfExpressionSyntax ifaceTypeOf }, { Expression: TypeOfExpressionSyntax implTypeOf }])
+                {
+                    ITypeSymbol? ifaceSym = sm.GetTypeInfo(ifaceTypeOf.Type).Type;
+                    ITypeSymbol? implSym = sm.GetTypeInfo(implTypeOf.Type).Type;
+                    if (ifaceSym is null || implSym is null) continue;
+
+                    string iface = Sym.Name(ifaceSym), impl = Sym.Name(implSym);
+                    string lifetime = openName.Identifier.Text["Add".Length..];
+                    Emit(context, sink, path, Sym.Line(inv), $"{openName.Identifier.Text}({iface},{impl})",
+                        iface, Sym.ProjectOf(ifaceSym) ?? project, impl, Sym.ProjectOf(implSym) ?? project, lifetime);
+                }
             }
         }
 
         return Task.CompletedTask;
     }
 
+    private static void Emit(IAnalysisContext context, IDiscoverySink sink, string path, int line, string symbolName,
+        string iface, string ifaceProj, string impl, string implProj, string lifetime)
+    {
+        KnowledgeIdentity implId = context.NodeId(Sym.Seg("project", implProj), Sym.Seg("type", impl));
+        KnowledgeIdentity ifaceId = context.NodeId(Sym.Seg("project", ifaceProj), Sym.Seg("type", iface));
+        Evidence ev = context.Evidence(path, line, symbolName);
+        string implKind = impl.EndsWith("Repository", StringComparison.Ordinal) ? "Repository" : "Service";
+        sink.Add(NodeDiscovery.Create(implId, NodeKind.From(implKind), new[] { ev }, Confidence.Full,
+            Sym.Props(("name", impl.Split('.').Last()), ("lifetime", lifetime))));
+        sink.Add(RelationshipDiscovery.Create(RelationshipType.From("IMPLEMENTS"), implId, ifaceId, new[] { ev }, Confidence.Full));
+    }
+
     private static (string Name, string Project) Resolve(SemanticModel sm, TypeSyntax type, string fallbackProject) =>
         sm.GetSymbolInfo(type).Symbol is ITypeSymbol s
             ? (Sym.Name(s), Sym.ProjectOf(s) ?? fallbackProject)
             : (type.ToString(), fallbackProject);
+
+    // The type actually constructed inside a factory lambda's body — handles both an expression-bodied
+    // lambda (sp => new Foo()) and a block-bodied one (sp => { ...; return new Foo(); }); a multi-return
+    // block only resolves its LAST return, a reasonable simplification for the common factory shape.
+    private static ITypeSymbol? FactoryReturnType(AnonymousFunctionExpressionSyntax lambda, SemanticModel sm)
+    {
+        ExpressionSyntax? expr = lambda.Body as ExpressionSyntax
+            ?? (lambda.Body as BlockSyntax)?.Statements.OfType<ReturnStatementSyntax>().LastOrDefault()?.Expression;
+
+        return expr is null ? null : sm.GetTypeInfo(expr).Type;
+    }
 }
 
 /// <summary>Detects the application entry point (the Program host component). Endpoint detection lives in
@@ -874,6 +1425,7 @@ internal sealed class MinimalApiAnalyzer : IAnalyzer
         {
             SyntaxNode root = tree.GetRoot();
             string path = model.PathOf(tree);
+            SemanticModel sm = model.GetSemanticModel(tree);
 
             // (2) Endpoint-group classes: /api/{ClassName} prefix; their Map* calls are handled here.
             var groupClasses = new HashSet<InvocationExpressionSyntax>();
@@ -887,7 +1439,7 @@ internal sealed class MinimalApiAnalyzer : IAnalyzer
                     if (MapVerb(inv) is not string verb) continue;
                     groupClasses.Add(inv);
                     string route = Combine(prefix, LiteralArg(inv) ?? "");
-                    Emit(context, sink, path, inv, verb, route, HandlerArg(inv));
+                    Emit(context, sink, path, inv, verb, route, HandlerArg(inv), sm);
                 }
             }
 
@@ -908,22 +1460,44 @@ internal sealed class MinimalApiAnalyzer : IAnalyzer
                 if (literal is null) continue;                            // needs an explicit route literal
                 string prefix = inv.Expression is MemberAccessExpressionSyntax { Expression: IdentifierNameSyntax id }
                     && groupPrefix.TryGetValue(id.Identifier.Text, out string? p) ? p : "";
-                Emit(context, sink, path, inv, verb, Combine(prefix, literal), HandlerArg(inv));
+                Emit(context, sink, path, inv, verb, Combine(prefix, literal), HandlerArg(inv), sm);
             }
         }
 
         return Task.CompletedTask;
     }
 
-    private void Emit(IAnalysisContext context, IDiscoverySink sink, string path, InvocationExpressionSyntax inv, string verb, string route, string? handler)
+    private void Emit(IAnalysisContext context, IDiscoverySink sink, string path, InvocationExpressionSyntax inv, string verb, string route, string? handler, SemanticModel sm)
     {
         route = Constraint.Replace(route, "{$1}");
         Evidence ev = context.Evidence(path, Sym.Line(inv), handler ?? verb);
         var props = new List<(string, string)> { ("verb", verb), ("route", route) };
         if (handler is not null) props.Add(("action", handler));
         if (ChainedAuthorization(inv) is { } auth) props.Add(("authorize", auth));
-        sink.Add(NodeDiscovery.Create(context.AppNodeId(Sym.Seg("endpoint", $"{verb} {route}")),
-            NodeKind.From("Endpoint"), new[] { ev }, Confidence.From(0.9), Sym.Props(props.ToArray())));
+
+        // Inline lambda handlers (the common minimal-API shape, e.g. app.MapPost("/x", async (ISender s, ...)
+        // => ...)) can dispatch straight to a mediator — see MediatorDispatch — and their own signature is
+        // the endpoint's real parameter/return-type contract. A method-group handler (a named delegate
+        // defined elsewhere) isn't walked here for either purpose; that would need cross-file method-body
+        // resolution this analyzer doesn't otherwise do, so it's a disclosed scope limit, not a guess.
+        AnonymousFunctionExpressionSyntax? lambda = inv.ArgumentList.Arguments.Select(a => a.Expression)
+            .OfType<AnonymousFunctionExpressionSyntax>().FirstOrDefault();
+        SyntaxNode? handlerBody = lambda?.Body;
+        if (lambda is not null && sm.GetSymbolInfo(lambda).Symbol is IMethodSymbol lambdaSymbol)
+        {
+            props.Add(("returns", Sym.ReturnTypeOf(lambdaSymbol)));
+            if (Sym.ParametersOf(lambdaSymbol) is { } paramsStr) props.Add(("parameters", paramsStr));
+        }
+
+        KnowledgeIdentity endpointId = context.AppNodeId(Sym.Seg("endpoint", $"{verb} {route}"));
+        sink.Add(NodeDiscovery.Create(endpointId, NodeKind.From("Endpoint"), new[] { ev }, Confidence.From(0.9), Sym.Props(props.ToArray())));
+
+        foreach (INamedTypeSymbol request in MediatorDispatch.FindDispatchedRequests(handlerBody, sm))
+        {
+            KnowledgeIdentity requestId = context.NodeId(
+                Sym.Seg("project", Sym.ProjectOf(request) ?? context.Artifact.Name), Sym.Seg("type", Sym.Name(request)));
+            sink.Add(RelationshipDiscovery.Create(RelationshipType.From("DISPATCHES"), endpointId, requestId, new[] { ev }, Confidence.From(0.85)));
+        }
     }
 
     // Minimal APIs attach authorization via a fluent suffix on the same statement, e.g.
@@ -1022,6 +1596,65 @@ internal sealed class ConfigurationAnalyzer : IAnalyzer
     }
 }
 
+/// <summary>
+/// Reads code-level configuration access Roslyn sees directly — as distinct from
+/// <see cref="ConfigurationAnalyzer"/>, which reads the appsettings*.json FILES themselves, not how the
+/// code reads them. Covers three call shapes: an <c>IConfiguration</c>/<c>IConfigurationSection</c>
+/// indexer (<c>configuration["Key"]</c>) or <c>.GetValue&lt;T&gt;("Key")</c>/<c>.GetSection("Key")</c>
+/// call; <c>Environment.GetEnvironmentVariable("KEY")</c>; and an <c>IFeatureManager</c>/
+/// <c>IFeatureManagerSnapshot.IsEnabledAsync("Flag")</c> call. Only the key/flag name is ever recorded —
+/// never a resolved value, which isn't knowable through static analysis anyway — and only when it's a
+/// literal string; a key built from a variable or interpolation is skipped rather than guessed at.
+/// </summary>
+internal sealed class ConfigurationUsageAnalyzer : IAnalyzer
+{
+    public string Name => "configuration-usage";
+
+    public Task AnalyzeAsync(IAnalysisContext context, IDiscoverySink sink, CancellationToken ct = default)
+    {
+        var model = (RoslynSemanticModel)context.Model;
+        foreach (SyntaxTree tree in model.Trees)
+        {
+            SemanticModel sm = model.GetSemanticModel(tree);
+            string path = model.PathOf(tree);
+
+            foreach (ElementAccessExpressionSyntax access in tree.GetRoot().DescendantNodes().OfType<ElementAccessExpressionSyntax>())
+            {
+                if (access.ArgumentList.Arguments is not [{ Expression: LiteralExpressionSyntax { Token.Value: string key } }]) continue;
+                if (sm.GetTypeInfo(access.Expression).Type is not { } receiver || !IsConfigurationType(receiver)) continue;
+                Emit(context, sink, path, Sym.Line(access), key, "IConfiguration");
+            }
+
+            foreach (InvocationExpressionSyntax inv in tree.GetRoot().DescendantNodes().OfType<InvocationExpressionSyntax>())
+            {
+                if (inv.Expression is not MemberAccessExpressionSyntax member) continue;
+                if (inv.ArgumentList.Arguments.FirstOrDefault()?.Expression is not LiteralExpressionSyntax { Token.Value: string arg }) continue;
+                string method = member.Name.Identifier.Text;
+                ITypeSymbol? receiver = sm.GetTypeInfo(member.Expression).Type;
+
+                if (method is "GetValue" or "GetSection" && receiver is not null && IsConfigurationType(receiver))
+                    Emit(context, sink, path, Sym.Line(inv), arg, "IConfiguration");
+                else if (method == "GetEnvironmentVariable" && sm.GetSymbolInfo(member).Symbol?.ContainingType?.ToDisplayString() == "System.Environment")
+                    Emit(context, sink, path, Sym.Line(inv), arg, "EnvironmentVariable");
+                else if (method == "IsEnabledAsync" && receiver is not null && receiver.Name is "IFeatureManager" or "IFeatureManagerSnapshot")
+                    Emit(context, sink, path, Sym.Line(inv), arg, "FeatureFlag");
+            }
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private static bool IsConfigurationType(ITypeSymbol t) =>
+        t.Name is "IConfiguration" or "IConfigurationSection" || t.AllInterfaces.Any(i => i.Name is "IConfiguration" or "IConfigurationSection");
+
+    private static void Emit(IAnalysisContext context, IDiscoverySink sink, string path, int line, string key, string source)
+    {
+        Evidence ev = context.Evidence(path, line, key);
+        sink.Add(NodeDiscovery.Create(context.AppNodeId(Sym.Seg("configuration", key)), NodeKind.From("Configuration"),
+            new[] { ev }, Confidence.From(0.8), Sym.Props(("name", key), ("source", source))));
+    }
+}
+
 /// <summary>Maps a package id fragment to a technical capability — grounded facts for the technology stack.</summary>
 internal static class CapabilityRules
 {
@@ -1076,6 +1709,7 @@ internal static class CapabilityRules
         ("Hangfire",                      "Background Jobs",   "Hangfire"),
         ("Quartz",                        "Background Jobs",   "Quartz.NET"),
         ("NServiceBus",                   "Messaging",         "NServiceBus"),
+        ("Microsoft.FeatureManagement",   "Configuration",     "Feature Management"),
         ("blazor",                        "Frontend",          "Blazor"),
         ("xunit",                         "Testing",           "xUnit"),
         ("nunit",                         "Testing",           "NUnit"),
@@ -1103,15 +1737,16 @@ internal sealed class PackageAnalyzer : IAnalyzer
         catch { return Task.CompletedTask; }
 
         var packages = doc.Descendants().Where(e => e.Name.LocalName == "PackageReference")
-            .Select(e => e.Attribute("Include")?.Value).Where(p => !string.IsNullOrWhiteSpace(p)).Select(p => p!).ToList();
+            .Select(e => (Id: e.Attribute("Include")?.Value, Version: e.Attribute("Version")?.Value ?? e.Element(e.Name.Namespace + "Version")?.Value))
+            .Where(p => !string.IsNullOrWhiteSpace(p.Id)).Select(p => (Id: p.Id!, p.Version)).ToList();
 
         string? tfm = doc.Descendants().FirstOrDefault(e => e.Name.LocalName is "TargetFramework" or "TargetFrameworks")?.Value;
         string? outputType = doc.Descendants().FirstOrDefault(e => e.Name.LocalName == "OutputType")?.Value;
         string sdk = doc.Root?.Attribute("Sdk")?.Value ?? "";
 
         // A project that references a test framework is a test project (kept distinct from app projects).
-        bool isTest = packages.Any(p => p.Contains("xunit", StringComparison.OrdinalIgnoreCase) || p.Contains("nunit", StringComparison.OrdinalIgnoreCase)
-            || p.Contains("MSTest", StringComparison.OrdinalIgnoreCase) || p.Contains("Microsoft.NET.Test.Sdk", StringComparison.OrdinalIgnoreCase));
+        bool isTest = packages.Any(p => p.Id.Contains("xunit", StringComparison.OrdinalIgnoreCase) || p.Id.Contains("nunit", StringComparison.OrdinalIgnoreCase)
+            || p.Id.Contains("MSTest", StringComparison.OrdinalIgnoreCase) || p.Id.Contains("Microsoft.NET.Test.Sdk", StringComparison.OrdinalIgnoreCase));
         string kind = isTest ? "test"
             : sdk.Contains("Web", StringComparison.OrdinalIgnoreCase) ? "web"
             : string.Equals(outputType, "Exe", StringComparison.OrdinalIgnoreCase) ? "executable" : "library";
@@ -1122,17 +1757,31 @@ internal sealed class PackageAnalyzer : IAnalyzer
         sink.Add(NodeDiscovery.Create(context.NodeId(Sym.Seg("project", project)),
             NodeKind.From("Project"), new[] { pev }, Confidence.Full, Sym.Props(projProps.ToArray())));
 
-        foreach (string package in packages)
+        foreach ((string package, string? version) in packages)
         {
             foreach ((string fragment, string category, string techName) in CapabilityRules.Rules)
             {
                 if (!package.Contains(fragment, StringComparison.OrdinalIgnoreCase)) continue;
                 Evidence ev = context.Evidence(csproj, null, package);
+                var techProps = new List<(string, string)> { ("name", techName), ("category", category), ("package", package) };
+                if (!string.IsNullOrWhiteSpace(version)) techProps.Add(("version", version));
                 sink.Add(NodeDiscovery.Create(context.AppNodeId(Sym.Seg("technology", techName)),
-                    NodeKind.From("Technology"), new[] { ev }, Confidence.Full,
-                    Sym.Props(("name", techName), ("category", category), ("package", package))));
+                    NodeKind.From("Technology"), new[] { ev }, Confidence.Full, Sym.Props(techProps.ToArray())));
                 break;   // rules are ordered specific→generic; the most specific capability wins (no "Azure SDK" noise)
             }
+        }
+
+        // Project → Project REFERENCES edges — the same XML the .sln/.slnx scoping already trusts, just
+        // read at the individual-project level rather than the solution level.
+        foreach (string? refPath in doc.Descendants().Where(e => e.Name.LocalName == "ProjectReference")
+            .Select(e => e.Attribute("Include")?.Value).Where(p => !string.IsNullOrWhiteSpace(p)))
+        {
+            string referencedProject = Path.GetFileNameWithoutExtension(refPath!.Replace('\\', '/'));
+            if (referencedProject.Length == 0 || referencedProject == project) continue;
+            Evidence ev = context.Evidence(csproj, null, referencedProject);
+            sink.Add(RelationshipDiscovery.Create(RelationshipType.From("REFERENCES"),
+                context.NodeId(Sym.Seg("project", project)), context.NodeId(Sym.Seg("project", referencedProject)),
+                new[] { ev }, Confidence.Full));
         }
 
         return Task.CompletedTask;

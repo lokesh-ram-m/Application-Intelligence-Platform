@@ -72,7 +72,6 @@ internal static class DocumentEndpoints
             sb.Append("""
                 <div class="empty-state">
                   <p>No applications documented yet.</p>
-                  <code>dotnet run --project src/Aip.Host -- run --config apps.yml</code>
                 </div>
                 """);
         }

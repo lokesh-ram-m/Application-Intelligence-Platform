@@ -41,7 +41,7 @@ internal sealed class NextPlugin : IPlugin
         Version: "0.1.0",
         SupportedArtifacts: new[] { "nextjs-workspace" },
         Languages: new[] { "typescript" },
-        Capabilities: new[] { "UIComponent", "Hook", "ApiCall", "Context", "Route", "Role", "DataGrid", "AnalyticsChart", "Filter", "ImportExport", "FormField", "AuthProvider", "TokenStorage", "TokenAttachment" },
+        Capabilities: new[] { "UIComponent", "Hook", "ApiCall", "Context", "Route", "Role", "DataGrid", "AnalyticsChart", "Filter", "ImportExport", "FormField", "AuthProvider", "TokenStorage", "TokenAttachment", "Configuration" },
         Priority: 95,
         Dependencies: new[] { "aip.plugins.aspnetcore" });
 

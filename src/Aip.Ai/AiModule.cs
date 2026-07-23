@@ -46,7 +46,11 @@ internal static class PromptTemplates
         "GROUNDED MARKDOWN derived from a structured knowledge model. Rewrite it into clear, descriptive " +
         "prose and Markdown. You may add explanation, structure, and headings, but use ONLY the facts " +
         "present — never invent endpoints, technologies, entities, or components. Preserve every Markdown " +
-        "table and every ```mermaid``` code block verbatim. If information is absent, say so plainly.\n\n" +
+        "table and every ```mermaid``` code block verbatim — copy it character-for-character, including " +
+        "the literal `-->`/`<`/`>` arrow and comparison characters exactly as given. Do NOT HTML-entity-" +
+        "escape anything inside a mermaid block (never turn `-->` into `--&gt;`, or `<`/`>` into `&lt;`/" +
+        "`&gt;` anywhere in it) — mermaid's own parser requires the literal characters, and an escaped " +
+        "arrow breaks the diagram entirely. If information is absent, say so plainly.\n\n" +
         "Do NOT transcribe the grounded bullet lists back out as bullet lists with the same facts in the " +
         "same order — that is not documentation, it's a copy. SYNTHESIZE: group related facts by what a " +
         "reader actually wants to know (by role, by workflow, by capability) and explain them as plain " +
@@ -64,7 +68,17 @@ internal static class PromptTemplates
         "be true of nearly any app using that framework. If a section's grounded facts don't support a real " +
         "paragraph, write one or two honest, direct sentences saying what's missing and stop — do not " +
         "restate the same absence three ways to reach paragraph length. A short accurate section beats a " +
-        "long vague one every time.";
+        "long vague one every time.\n\n" +
+        "The 'never invent' rule above applies with special force to PROPER NOUNS AND SPECIFIC NAMES: a " +
+        "controller name, component name, table name, column name, screen name, or endpoint path may only " +
+        "appear in your output if that exact string is present in the grounded source below. If you want to " +
+        "describe a capability but the source doesn't name the specific class, screen, or field responsible " +
+        "for it, describe the capability in general terms instead — never invent a plausible-sounding name " +
+        "to attach it to, and never invent a UI element (a table, a column set, a sub-screen) that isn't " +
+        "explicitly described in the grounded facts just because it would make the writing feel more " +
+        "complete. When several individually-named facts don't obviously add up to a feature you'd like to " +
+        "describe, resist the pull to invent the missing piece connecting them — state what's grounded and " +
+        "stop there.";
 
     // Shared by the three product-spec templates below (the only ones that ever receive {{notes}} — see
     // DocumentationProjection.Page). {{notes}} is always present in values but resolves to an empty string
@@ -112,7 +126,15 @@ internal static class PromptTemplates
             " Grounded source:\n{{model}}{{notes}}",
         ["tech-architecture"] =
             "Rewrite this architecture page for '{{app}}' with descriptive prose on layers, components, and how " +
-            "they fit together. Keep the mermaid diagram and any tables exactly as-is. Grounded source:\n{{model}}",
+            "they fit together. Keep every mermaid diagram (there may be more than one — e.g. a component-" +
+            "relationship graph and a request-flow sequence diagram) and every table exactly as-is, each in its " +
+            "own section, none merged together or dropped. The 'Components' section and the diagrams list every " +
+            "controller/service/entity actually found — when describing what handles a particular concern (e.g. " +
+            "'which controller manages X'), name only a controller that is explicitly listed there; if no listed " +
+            "controller obviously matches, describe the concern without naming a specific controller for it " +
+            "rather than guessing one into existence. If a 'Status workflows' section is present, keep it as " +
+            "its own section listing the named states per property — do not invent a transition order between " +
+            "the states beyond what's stated (no order is grounded). Grounded source:\n{{model}}",
         ["tech-api"] =
             "Rewrite this API reference for '{{app}}'. Keep every table exactly as-is; add only brief framing. " +
             "Grounded source:\n{{model}}",
@@ -164,25 +186,42 @@ internal static class PromptTemplates
             "through the pages/components that role's routes render. Weave it into the same per-role " +
             "paragraphs as real, concrete evidence (e.g. 'Admins can reach the full set of contract and user " +
             "management endpoints, while Managers are limited to...'), not as a separate disconnected list. " +
-            "Grounded source:\n{{model}}",
+            "If a 'User journeys (by role)' section with a ```mermaid``` ```journey``` block is present, that " +
+            "diagram is the exception to 'rewrite as prose' — copy it verbatim (heading, caption, and code " +
+            "block unchanged) and place it after your per-role paragraphs; do not describe its content in " +
+            "prose instead of keeping the diagram, and do not drop it. Grounded source:\n{{model}}",
         ["tech-frontend-screens"] =
             "Rewrite this into a short 'Screens & Capabilities' section for '{{app}}'s frontend, describing " +
             "what a user can actually do on each screen — as flowing prose, not a restatement of the grounded " +
             "bullet list. For each data grid, say what information it actually displays (name the columns, not " +
-            "just 'this grid has columns'). For filters, say what they let a user narrow down, grouped by " +
-            "screen. For import/export or file upload capability, say what it's for. For each form, the fields " +
-            "it collects and their validation rules in plain language (e.g. 'X is required'). Grounded source:\n{{model}}",
+            "just 'this grid has columns') — but ONLY the columns explicitly listed in the grounded source; " +
+            "if a screen is named but no grid/column/field detail was grounded for it, say only what the source " +
+            "gives you (its name, or its role if that's grounded) and stop — do not invent plausible columns, " +
+            "a details/history sub-table, or additional screens to round it out. For filters, say what they let " +
+            "a user narrow down, grouped by screen. For import/export or file upload capability, say what it's " +
+            "for. For each form, the fields it collects and their validation rules in plain language (e.g. 'X " +
+            "is required'). Grounded source:\n{{model}}",
         ["tech-frontend-components"] =
             "Rewrite this into a short 'Component Inventory' section for '{{app}}'s frontend — a technical " +
             "catalogue of pages, components, hooks, state, services, and backend connectivity, as flowing " +
             "prose, not a restatement of the grounded bullet list. When a Page or Component lists what it " +
             "'renders', use that to describe what's actually built into that screen (e.g. which charts or cards " +
-            "compose it) instead of describing it by name alone. Describe how frontend calls connect to backend " +
-            "endpoints where that's grounded. Grounded source:\n{{model}}",
+            "compose it) instead of describing it by name alone — but only what's listed there; do not credit a " +
+            "page with functionality (e.g. that a list is editable, or saves changes somewhere) that isn't " +
+            "shown in its grounded facts, even if that would be the natural feature for a page with that name " +
+            "to have. Describe how frontend calls connect to backend endpoints where that's grounded. Grounded " +
+            "source:\n{{model}}",
         ["tech-security"] =
             "Rewrite this into a security & authentication page for '{{app}}', as flowing prose organized by " +
-            "topic, not a restatement of the grounded bullet list. Cover, wherever the grounded facts support " +
-            "it: (1) how a user authenticates end-to-end — identify the actual mechanism (JWT, cookie session, " +
+            "topic, not a restatement of the grounded bullet list. If the grounded source has a '## " +
+            "Vulnerabilities' heading, keep it as its own separate section, in your output, positioned first " +
+            "— before authentication/authorization/anything else. These are actionable findings (a leaked " +
+            "credential, an open CORS policy, a vulnerable dependency), not general security architecture " +
+            "description, and folding them into another topic (e.g. merging a leaked-credential finding into " +
+            "'password/secret handling' below) would bury something a reader needs to act on. You may rewrite " +
+            "its wording for clarity, but keep every individual finding (the fact, the file, the severity) — " +
+            "never drop one, and never merge it into a different section. Cover, wherever the grounded facts " +
+            "support it: (1) how a user authenticates end-to-end — identify the actual mechanism (JWT, cookie session, " +
             "an external identity provider such as Azure AD/Okta/Auth0) and name the concrete login/token " +
             "endpoint(s) if any were found. State the endpoints as facts first; only after that, if their names " +
             "together clearly match a well-known pattern (e.g. separate login/callback/refresh-token endpoints " +
